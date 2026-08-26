@@ -1,0 +1,20 @@
+# --- web layer ---
+Flask>=3.0,<4
+flask-cors>=4.0
+python-dotenv>=1.0
+
+# --- transcription ---
+faster-whisper>=1.0
+
+# --- ingestion ---
+yt-dlp>=2024.8.6
+
+# --- retrieval / orchestration ---
+chromadb>=0.5,<0.7
+langchain-core>=0.3
+langchain-text-splitters>=0.3
+langchain-ollama>=0.2
+
+# --- misc ---
+pydantic>=2.7
+requests>=2.31

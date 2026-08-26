@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipFarm — long-form video to shorts</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎬</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">✂</span>
+    <div>
+      <h1>clipFarm</h1>
+      <p class="tagline">Whisper → ChromaDB → Ollama → vertical clips</p>
+    </div>
+  </div>
+  <div id="health" class="health" title="System check">
+    <span class="dot dot--idle"></span><span class="health-text">checking…</span>
+  </div>
+</header>
+
+<main>
+  <!-- ── new job ─────────────────────────────────────────── -->
+  <section class="panel" id="new-job">
+    <div class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="upload" role="tab">Upload a file</button>
+      <button class="tab" data-tab="url" role="tab">Paste a URL</button>
+    </div>
+
+    <div class="pane is-active" id="pane-upload">
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept="video/*,audio/*" hidden>
+        <span class="dz-icon" aria-hidden="true">⬆</span>
+        <span class="dz-title">Drop a video or audio file</span>
+        <span class="dz-hint">mp4 · mov · mkv · webm · mp3 · wav · m4a</span>
+      </label>
+      <p class="filename" id="filename" hidden></p>
+    </div>
+
+    <div class="pane" id="pane-url">
+      <div class="row">
+        <input type="url" id="url-input" placeholder="https://www.youtube.com/watch?v=…"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <p class="hint">The video is downloaded with yt-dlp, then processed locally.</p>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn--primary" id="submit">Generate clips</button>
+      <span class="err" id="submit-error" hidden></span>
+    </div>
+  </section>
+
+  <!-- ── active job ──────────────────────────────────────── -->
+  <section class="panel" id="job-panel" hidden>
+    <div class="job-head">
+      <div>
+        <h2 id="job-title">Processing…</h2>
+        <p class="job-sub" id="job-sub"></p>
+      </div>
+      <div class="job-head-right">
+        <span class="pill" id="job-status">queued</span>
+        <button class="btn btn--ghost" id="cancel" hidden>Cancel</button>
+      </div>
+    </div>
+
+    <ol class="rail" id="rail"></ol>
+
+    <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+    <p class="job-message" id="job-message">Queued</p>
+    <p class="err" id="job-error" hidden></p>
+
+    <details class="logbox">
+      <summary>Pipeline log</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+
+  <!-- ── clips ───────────────────────────────────────────── -->
+  <section id="clips-section" hidden>
+    <div class="section-head">
+      <h2>Generated clips</h2>
+      <span class="muted" id="clips-meta"></span>
+    </div>
+    <div class="clip-grid" id="clips"></div>
+  </section>
+
+  <!-- ── semantic search ─────────────────────────────────── -->
+  <section class="panel" id="search-panel" hidden>
+    <h2>Search the transcript</h2>
+    <p class="hint">Vector search over this video's ChromaDB collection — the same
+      index the clip selector queries.</p>
+    <div class="row">
+      <input type="search" id="search-input"
+             placeholder="e.g. the part about compounding habits" autocomplete="off">
+      <button class="btn" id="search-btn">Search</button>
+    </div>
+    <div id="search-results" class="search-results"></div>
+  </section>
+
+  <!-- ── history ─────────────────────────────────────────── -->
+  <section id="history-section" hidden>
+    <div class="section-head"><h2>Previous runs</h2></div>
+    <div class="history" id="history"></div>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
