@@ -18,7 +18,7 @@ from typing import Any
 
 import config
 from app.core import (
-    boundaries, ingest, render, scoring, timeline, topics, transcribe,
+    ads, boundaries, ingest, render, scoring, timeline, topics, transcribe,
 )
 from app.core.chunker import WindowBuilder
 from app.core.vectorstore import StreamingIndex
@@ -165,6 +165,18 @@ def process(job: Job) -> None:
             threshold=config.TOPIC_SHIFT_THRESHOLD,
         )
 
+    # Sponsor reads and subscribe asks are scripted and punchy, so they score
+    # well and are worthless as clips. Find them once, keep candidates out of
+    # them, and excise any that land inside a chosen span.
+    ad_spans: list[dict[str, Any]] = []
+    if config.AD_DETECTION:
+        ad_spans = ads.find_excluded_spans(
+            words,
+            gap_seconds=config.AD_GAP_SECONDS,
+            min_seconds=config.AD_MIN_SECONDS,
+            filler=config.FILLER_DETECTION,
+        )
+
     # Each slot aims at its own slice of the allowed length range, otherwise
     # every clip comes back about the same length.
     buckets = (
@@ -179,6 +191,26 @@ def process(job: Job) -> None:
                 f"{lo:.0f}-{hi:.0f}s" for lo, hi in buckets))
         if topic_boundaries:
             rep.log(f"{len(topic_boundaries)} topic boundaries detected")
+        for advert in ad_spans:
+            rep.log(f"Excluding {advert['reason']} at "
+                    f"{advert['start'] / 60:.1f}-{advert['end'] / 60:.1f} min "
+                    f"({advert['end'] - advert['start']:.0f}s)")
+
+        # Drop candidates that sit inside excluded content before spending LLM
+        # time on them.
+        if ad_spans:
+            kept = [
+                c for c in candidates
+                if not ads.is_advert((c["start"], c["end"]), ad_spans,
+                                     threshold=config.AD_OVERLAP_THRESHOLD)
+            ]
+            if kept:
+                dropped = len(candidates) - len(kept)
+                if dropped:
+                    rep.log(f"Discarded {dropped} candidate(s) inside "
+                            f"sponsor reads or housekeeping")
+                candidates = kept
+
         for i, candidate in enumerate(candidates):
             _check(job)
             rep.progress(
@@ -200,6 +232,7 @@ def process(job: Job) -> None:
                     media_duration=media_info["duration"],
                     topic_boundaries=topic_boundaries,
                     duration_range=bucket,
+                    ad_spans=ad_spans,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad candidate must not kill the run
                 rep.log(f"Candidate {i + 1} failed to score: {exc}")
@@ -211,6 +244,18 @@ def process(job: Job) -> None:
             raise ValueError("No candidate could be scored — is Ollama running?")
 
         scored.sort(key=lambda c: c["final_score"], reverse=True)
+
+        # Excising filler can leave a clip too short to post. Better to drop it
+        # than to ship a ten second fragment — unless that leaves nothing.
+        full_length = [
+            c for c in scored
+            if c["duration"] >= config.CLIP_MIN_SECONDS - 0.5
+        ]
+        if full_length and len(full_length) < len(scored):
+            rep.log(f"Dropped {len(scored) - len(full_length)} clip(s) left "
+                    f"under {config.CLIP_MIN_SECONDS:.0f}s after trimming")
+        scored = full_length or scored
+
         deduped = scoring.dedupe_spans(scored, max_overlap=0.35)
         selected = (
             scoring.spread_by_duration(deduped, config.MAX_CLIPS)
@@ -218,6 +263,48 @@ def process(job: Job) -> None:
         )
         rep.progress(1.0, f"Selected {len(selected)} clips — " + ", ".join(
             f"{c['duration']:.0f}s" for c in selected))
+
+        # A second look at the finalists only — cheap, because it is five calls
+        # rather than one per candidate. Its suggestions are advisory and must
+        # clear the same gates as any other span before being adopted.
+        if config.CRITIC_PASS:
+            reviewed: list[dict[str, Any]] = []
+            for i, pick in enumerate(selected):
+                _check(job)
+                rep.progress(i / max(len(selected), 1),
+                             f"Reviewing clip {i + 1}/{len(selected)}…")
+                lines = scoring.build_lines(
+                    segments,
+                    pick["start"] - config.SETUP_CONTEXT_SECONDS,
+                    pick["end"] + config.REVEAL_WINDOW_SECONDS + 10.0,
+                )
+                try:
+                    critique = scoring.critique_clip(pick, lines)
+                    pick = scoring.apply_critique(
+                        pick, critique, lines,
+                        words=words,
+                        media_duration=media_info["duration"],
+                        topic_boundaries=topic_boundaries,
+                        ad_spans=ad_spans,
+                    )
+                except Exception as exc:  # noqa: BLE001 - review is optional
+                    rep.log(f"Review of clip {i + 1} failed: {exc}")
+                verdict = pick.get("critique") or {}
+                if verdict.get("applied"):
+                    rep.log(f"Recut clip {i + 1} — {verdict.get('verdict', '')}")
+                elif verdict.get("verdict"):
+                    flags = [
+                        name for name, bad in (
+                            ("no hook at start", not verdict["opens_on_hook"]),
+                            ("missing payoff", not verdict["contains_payoff"]),
+                            ("housekeeping", verdict["has_housekeeping"]),
+                        ) if bad
+                    ]
+                    if flags:
+                        rep.log(f"Clip {i + 1} flagged ({', '.join(flags)}) "
+                                f"but the suggested recut did not qualify")
+                reviewed.append(pick)
+            selected = reviewed
     _check(job)
 
     # --- 6. render ---
@@ -269,6 +356,10 @@ def process(job: Job) -> None:
                                         "subtitles_srt", "captions_burned",
                                         "caption_backend", "spans", "stitched",
                                         "fill", "crop", "subject_x")},
+                "hook_at": pick.get("hook_at"),
+                "hook_anchored": pick.get("hook_anchored"),
+                "reveal_completed": pick.get("reveal_completed"),
+                "critique": pick.get("critique"),
             }
             if info.get("captions_skipped_reason") and i == 0:
                 rep.log(f"Captions not burned in — {info['captions_skipped_reason']}. "
@@ -294,6 +385,8 @@ def process(job: Job) -> None:
 
     store.update(job.id, stats={
         **job.stats,
+        "ad_spans": ad_spans,
+        "ad_seconds": round(sum(a["end"] - a["start"] for a in ad_spans), 1),
         "candidates_retrieved": len(candidates),
         "candidates_scored": len(scored),
         "clips": len(clips),

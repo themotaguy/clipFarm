@@ -519,3 +519,94 @@ def test_trimmed_setup_span_does_not_start_mid_word(transcript, monkeypatch):
                 if float(w["start"]) < edge < float(w["end"])
             ]
             assert not straddling, f"edge {edge} lands inside {straddling}"
+
+
+# --- critic pass ---
+
+def _critic_lines(transcript):
+    return scoring.build_lines(transcript, 0.0, 10_000.0)
+
+
+def test_critique_is_skipped_without_lines(transcript):
+    assert scoring.critique_clip({"start": 0.0, "end": 10.0}, []) is None
+
+
+def test_happy_critique_changes_nothing(transcript):
+    lines = _critic_lines(transcript)
+    clip = {"start": lines[2]["start"], "end": lines[6]["end"],
+            "hook": lines[2]["text"], "spans": [{"start": 0.0, "end": 1.0}]}
+    out = scoring.apply_critique(
+        clip,
+        {"opens_on_hook": True, "contains_payoff": True,
+         "has_housekeeping": False, "verdict": "good cut"},
+        lines,
+    )
+    assert out["critique"]["applied"] is False
+    assert out["spans"] == clip["spans"], "a passing review must not recut"
+
+
+def test_critique_rejected_when_it_would_lose_the_hook(transcript):
+    """Observed: the critic reports a missing payoff, then proposes bounds
+    that still miss it. Adopting that would undo the reveal completion."""
+    lines = _critic_lines(transcript)
+    words = [w for s in transcript for w in s["words"]]
+    hook = lines[8]
+    clip = {"start": lines[2]["start"], "end": hook["end"],
+            "hook": hook["text"],
+            "spans": [{"start": lines[2]["start"], "end": hook["end"]}],
+            "duration": hook["end"] - lines[2]["start"]}
+    out = scoring.apply_critique(
+        clip,
+        {"opens_on_hook": False, "contains_payoff": False,
+         "has_housekeeping": False,
+         # A recut that drops the hook entirely.
+         "suggested_start_line": 0, "suggested_end_line": 4,
+         "verdict": "needs work"},
+        lines, words=words, media_duration=1000.0,
+    )
+    assert out["critique"]["applied"] is False
+    assert out["spans"] == clip["spans"]
+
+
+def test_an_adopted_recut_is_always_a_legal_clip(transcript, monkeypatch):
+    """A one-line suggestion is grown to the minimum, not shipped as a scrap."""
+    monkeypatch.setattr(config, "CLIP_MIN_SECONDS", 30.0)
+    lines = _critic_lines(transcript)
+    clip = {"start": lines[0]["start"], "end": lines[9]["end"], "hook": "",
+            "spans": [{"start": lines[0]["start"], "end": lines[9]["end"]}],
+            "duration": 40.0}
+    out = scoring.apply_critique(
+        clip,
+        {"opens_on_hook": False, "contains_payoff": True,
+         "has_housekeeping": False,
+         "suggested_start_line": 0, "suggested_end_line": 0,
+         "verdict": "trim it"},
+        lines, words=[w for s in transcript for w in s["words"]],
+        media_duration=1000.0,
+    )
+    if out["critique"]["applied"]:
+        assert out["duration"] >= config.CLIP_MIN_SECONDS - 0.5
+        assert out["duration"] <= config.CLIP_MAX_SECONDS + 0.5
+
+
+def test_critique_rejected_when_it_lands_in_an_advert(transcript):
+    lines = _critic_lines(transcript)
+    words = [w for s in transcript for w in s["words"]]
+    advert = [{"start": lines[0]["start"], "end": lines[5]["end"]}]
+    clip = {"start": lines[6]["start"], "end": lines[10]["end"], "hook": "",
+            "spans": [{"start": lines[6]["start"], "end": lines[10]["end"]}],
+            "duration": 30.0}
+    out = scoring.apply_critique(
+        clip,
+        {"opens_on_hook": False, "contains_payoff": True,
+         "has_housekeeping": False,
+         "suggested_start_line": 0, "suggested_end_line": 3,
+         "verdict": "move it"},
+        lines, words=words, media_duration=1000.0, ad_spans=advert,
+    )
+    assert out["critique"]["applied"] is False
+
+
+def test_critique_absent_leaves_the_clip_alone():
+    clip = {"start": 1.0, "end": 2.0, "spans": [{"start": 1.0, "end": 2.0}]}
+    assert scoring.apply_critique(clip, None, []) == clip

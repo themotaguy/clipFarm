@@ -65,7 +65,15 @@ captions. Pin a specific binary with `FFMPEG_BINARY` if you would rather choose 
 brew install ffmpeg-full       # optional; adds libass (plus ~45 other libraries)
 ```
 
-`/api/health` reports which backend is live under `checks.captions.backend`. The Pillow path
+`/api/health` reports which backend is live under `checks.captions.backend`.
+
+Captions hold still on purpose. The phrase is redrawn once per word to move the
+highlight, so anything that changes between those redraws reads as flicker: the
+highlight is therefore **colour only** (scaling the active word changes the line's
+width, which re-centres it and makes the text jump sideways), fades apply only
+when a phrase **appears and leaves** rather than between its words, and a word
+holds the highlight for at least 130ms — Whisper times "in" or "the" at 60ms,
+two frames, which strobes. The Pillow path
 is a little slower (one image per caption phrase) and its text shaping is simpler, but it is
 visually equivalent: same grouping, same per-word highlight, same placement.
 
@@ -128,38 +136,62 @@ clips survive a server restart.
    Chroma collection. A window matched by several different probes scores higher than one that
    got lucky on a single narrow probe, and near-duplicate spans are suppressed before any LLM
    time is spent on them.
-2. **Score.** Each surviving candidate goes to Ollama with its numbered transcript lines. The
+2. **Skip the ads.** An integrated sponsor read is the worst possible clip: it is
+   scripted, punchy and enthusiastic, so it scores *well* — and it is worthless. A
+   strong marker ("sponsoring", "use code", "link in the description") seeds a
+   region, the sponsor's name is read out of that seed, and the region grows over
+   the neighbouring sentences that keep mentioning it — so the whole read is
+   excluded, not just the sentence that gave it away. Candidates inside one are
+   dropped before any LLM time is spent, and clip boundaries are never allowed to
+   grow into one.
+3. **Score.** Each surviving candidate goes to Ollama with its numbered transcript lines. The
    model returns a title, hook, tags, four sub-scores and an overall virality score — and picks
    the line to start and end on, which is then forced back inside the duration limits.
    `final_score = 0.75 × virality + 25 × retrieval_score`.
-3. **Finish the thought.** A grammatical full stop is not the end of a point — "So there are
+4. **Open on the hook.** The scorer names the single most scroll-stopping sentence,
+   then routinely sets in/out points that begin 6–43s earlier — on price admin, or a
+   subscribe ask — and in the worst case ends *just* before it. So the clip is
+   re-anchored onto the hook it named: guaranteed to contain it, and trimmed to open
+   on it. How much preamble may be skipped depends on how confidently the hook was
+   located, so a bad match cannot gut a clip.
+5. **Land the payoff.** A clip that ends on "the one more thing that we all saw
+   coming" wastes the whole buildup. When a reveal starts within ~25s of the cut, the
+   clip extends to include it. Gated on a reveal actually following rather than on
+   promise language alone, since plenty of promises resolve into nothing.
+6. **Finish the thought.** A grammatical full stop is not the end of a point — "So there are
    three moves." is a complete sentence and a terrible place to stop. The clip runs on to the
    next *topic* boundary when one is within reach, located from discourse markers ("So,",
    "Now,", "Here's the thing"), from how long the speaker pauses (the median gap at a sentence
    end is ~0.26s; a change of subject runs to half a second or more), and optionally from
    embedding drift between neighbouring passages.
-4. **Place the cuts.** The boundaries the model returns land on word edges, which sounds
+7. **Place the cuts.** The boundaries the model returns land on word edges, which sounds
    severed — the last word's decay gets chopped and there is no breath. So each edge is moved
    onto real silence: nearby pauses are scored, sentence breaks strongly preferred, and
    reaching forward to finish a sentence is treated as much cheaper than cutting a second
    early. No cut is ever left inside a word, including when a length cap or a budget forces
    one to move.
-5. **Stitch, if the clip needs it.** A clip opening "The third move is simply not calling the
+8. **Stitch, if the clip needs it.** A clip opening "The third move is simply not calling the
    model" makes no sense alone — nothing in it says what the first two were. When the opening
    refers to something it never explains, an earlier passage that introduces the referent is
    cut and played first, and the two spans are concatenated into one clip. The model is asked
    first; because a local 8B almost always insists the clip is self-contained, there is also a
    deterministic detector for enumerations ("the second option"), demonstratives ("that
    number"), dangling pronouns and explicit back-references ("as I said").
-6. **Spread the lengths.** Left alone, every clip comes back about the same length. Each of
+9. **Spread the lengths.** Left alone, every clip comes back about the same length. Each of
    the `MAX_CLIPS` slots is instead given its own slice of the allowed range — geometrically
    spaced, so the short end is finer — and the best-scoring clip in each slice is kept. A
    bucket may be overshot by 15% when that is what it takes to end cleanly; hitting a length
    target exactly is not worth ending mid-sentence for.
-7. **Render.** The chosen spans are cut to 9:16 with word-timed captions on top. A landscape
+10. **Render.** The chosen spans are cut to 9:16 with word-timed captions on top. A landscape
    source is *cropped* to fill the frame rather than letterboxed over a blur, and the crop
    follows the subject: sampled frames are scored per column for detail and motion, and the
    crop window is placed over the peak (see `RENDER_FILL`).
+
+Finally the five finalists get a second look: one LLM call each asking whether the clip
+opens on its hook, contains its payoff, and is free of housekeeping. That review is
+**advisory** — any bounds it proposes are re-snapped, re-excised and re-measured exactly
+like any other span, and rejected unless the result is a legal clip. A confidently wrong
+review should not be able to make a clip worse than the rules already made it.
 
 If Ollama returns unparseable JSON, it retries once with a blunter instruction, then falls
 back to a retrieval-only score so one bad response can't take down the run.
@@ -203,6 +235,16 @@ All optional — see `.env.example`. The defaults are what the numbers below wer
 | `CLIP_MIN_PAUSE`                           | `0.18`              | Shortest gap that counts as silence            |
 | `STITCH_SETUP`                             | `true`              | Allow a setup span before the payoff           |
 | `SETUP_MAX_SECONDS`                        | `20`                | Longest setup span                             |
+| `AD_DETECTION`                             | `true`              | Exclude integrated sponsor reads               |
+| `AD_OVERLAP_THRESHOLD`                     | `0.25`              | Drop a candidate this far inside an ad         |
+| `AD_GAP_SECONDS` / `AD_MIN_SECONDS`        | `30` / `6`          | How a read is clustered, and its minimum length|
+| `FILLER_DETECTION`                         | `true`              | Also exclude subscribe/like asks                |
+| `HOOK_ANCHOR`                              | `true`              | Re-anchor clips to open on their hook          |
+| `HOOK_TRIM_MAX_SECONDS`                    | `15`                | Preamble skippable on a fuzzy hook match       |
+| `HOOK_TRIM_STRONG_SECONDS`                 | `45`                | …and on a near-verbatim match                  |
+| `REVEAL_COMPLETION`                        | `true`              | Never end on a buildup whose payoff follows    |
+| `REVEAL_WINDOW_SECONDS`                    | `25`                | How far ahead to look for that payoff          |
+| `CRITIC_PASS`                              | `true`              | Review the finalists with a second LLM call    |
 | `SETUP_CONTEXT_SECONDS`                    | `60`                | Transcript shown either side of a candidate    |
 | `FLASK_HOST` / `FLASK_PORT`                | `127.0.0.1` / `5001`|                                                |
 | `MAX_UPLOAD_MB`                            | `2048`              | Upload ceiling                                 |
@@ -235,6 +277,8 @@ app/
   core/scoring.py     stages 4 & 5 — probe retrieval, then Ollama grading
   core/boundaries.py  moving cut points onto natural pauses
   core/topics.py      where a thought actually finishes
+  core/ads.py         sponsor reads and channel housekeeping
+  core/narrative.py   opening on the hook, landing the payoff
   core/framing.py     locating the subject so a landscape crop keeps them in shot
   core/context.py     spotting clips that open on an unexplained reference
   core/timeline.py    source-time <-> clip-time mapping for stitched clips
@@ -248,6 +292,30 @@ config.py             environment-backed settings
 tests/                pytest suite
 ```
 
+## Measuring clip quality
+
+Clip selection is heuristics stacked on a small local model, so "did that help?"
+needs a number rather than a vibe. `scripts/quality_report.py` replays the
+*current* rules over every saved transcript and scores the result:
+
+```bash
+python scripts/quality_report.py          # all saved jobs
+python scripts/quality_report.py --json   # machine readable
+```
+
+| column | meaning |
+| --- | --- |
+| `sentence` | ends on a full stop |
+| `no promise` | does not end on an unresolved buildup |
+| `clean cut` | no boundary inside a word |
+| `no filler` | under 25% sponsor or housekeeping |
+| `>=min` | at least `CLIP_MIN_SECONDS` long |
+| `hook@` | mean seconds from clip start to its hook — lower is better |
+
+It re-derives spans rather than grading the spans stored in each job file:
+those came from whatever the code looked like at the time, so grading them
+would measure history instead of the code in front of you.
+
 ## Tests
 
 ```bash
@@ -255,7 +323,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-293 tests, about fifteen seconds. The suite stubs Whisper and Ollama, so it needs neither; the
+344 tests, about fifteen seconds. The suite stubs Whisper and Ollama, so it needs neither; the
 `media` and `render` tests do shell out to a real ffmpeg and skip themselves if it is absent.
 
 ## Troubleshooting
@@ -271,6 +339,10 @@ python -m pytest
 | A clip stops before the point is made           | No topic boundary within `TOPIC_EXTEND_SECONDS`; raise it or `CLIP_MAX_SECONDS` |
 | The subject is cropped out of frame             | Set `RENDER_FILL=blur`, or `auto` to crop only when a subject is found       |
 | All clips come back the same length             | `DURATION_SPREAD=false`, or `MAX_CLIPS=1` leaves only one bucket             |
+| A clip came from the sponsor read               | Check the score-stage log for "Skipping sponsor read"; add the phrase to `ads.STRONG_MARKERS` |
+| Captions look jumpy                             | Shouldn't happen: highlights are colour-only and fade only at phrase edges   |
+| A clip opens on filler rather than the hook     | Check `hook@` in `scripts/quality_report.py`; raise `HOOK_TRIM_STRONG_SECONDS` |
+| A clip still ends on a buildup                  | The payoff was further than `REVEAL_WINDOW_SECONDS` away                     |
 | `Whisper produced no speech`                    | No audible dialogue, or the wrong `WHISPER_LANGUAGE`                        |
 | `No candidate could be scored`                  | Ollama is up but the model can't emit JSON — try another model               |
 | `no wheels` on install                          | You're on Python 3.13+; use 3.11                                            |

@@ -20,6 +20,15 @@ from app.core import timeline
 MAX_WORDS_PER_GROUP = 4
 MAX_CHARS_PER_GROUP = 24
 
+#: Fade applied when a phrase appears and disappears, in milliseconds.
+PHRASE_FADE_MS = 90
+
+#: Shortest time a word may hold the highlight. Whisper gives function words
+#: like "in" or "the" as little as 60ms — two frames at 30fps — and a highlight
+#: that jumps that fast reads as flicker rather than as following the speech.
+#: Slots below this are absorbed into the neighbouring word's.
+MIN_HIGHLIGHT_SECONDS = 0.13
+
 # ASS colours are &HBBGGRR (not RGB).
 IDLE_COLOUR = "&H00FFFFFF&"      # white
 ACTIVE_COLOUR = "&H0047E3FF&"    # amber
@@ -48,12 +57,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 @dataclass
 class CaptionEvent:
-    """One on-screen phrase, with the word currently being spoken marked."""
+    """One on-screen phrase, with the word currently being spoken marked.
+
+    `first`/`last` mark the phrase's outer edges. Only those get a fade: a
+    phrase is redrawn once per word, so fading every event makes the whole
+    line pulse on every syllable.
+    """
 
     start: float
     end: float
     tokens: list[str] = field(default_factory=list)
     active: int = 0
+    first: bool = True
+    last: bool = True
 
     @property
     def text(self) -> str:
@@ -91,6 +107,39 @@ def _group(words: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return groups
 
 
+def _slots(group: Sequence[dict[str, Any]]) -> list[tuple[float, float, int]]:
+    """`(start, end, highlighted_word)` per word, tiled with no gaps or overlaps.
+
+    Each word holds the highlight until the next one starts. Slots too short to
+    perceive are absorbed by a neighbour, so the highlight moves at a readable
+    pace instead of strobing through short words.
+    """
+    group_end = max(float(w["end"]) for w in group)
+    raw: list[tuple[float, float, int]] = []
+    cursor = float(group[0]["start"])
+    for i in range(len(group)):
+        end = float(group[i + 1]["start"]) if i + 1 < len(group) else group_end
+        end = max(end, cursor)
+        raw.append((cursor, end, i))
+        cursor = end
+
+    merged: list[tuple[float, float, int]] = []
+    for start, end, active in raw:
+        if end - start < MIN_HIGHLIGHT_SECONDS and merged:
+            # Hold the previous word's highlight through this one.
+            prev_start, _prev_end, prev_active = merged[-1]
+            merged[-1] = (prev_start, end, prev_active)
+            continue
+        merged.append((start, end, active))
+
+    # A too-short opening slot has no predecessor, so give its time to the next.
+    if len(merged) > 1 and merged[0][1] - merged[0][0] < MIN_HIGHLIGHT_SECONDS:
+        _start, _end, _active = merged.pop(0)
+        nxt_start, nxt_end, nxt_active = merged[0]
+        merged[0] = (_start, nxt_end, nxt_active)
+    return merged
+
+
 def build_events(
     segments: Iterable[dict[str, Any]],
     spans: Sequence[timeline.Span],
@@ -111,26 +160,19 @@ def build_events(
     events: list[CaptionEvent] = []
     for group in _group(words):
         tokens = [w["word"] for w in group]
-        group_end = max(w["end"] for w in group)
-        # Each word holds the highlight until the next one starts, so events
-        # tile exactly: the phrase never flickers and never doubles up.
-        #
-        # Deriving the start from the *previous* word's end instead would make
-        # consecutive events overlap by the silence between the words, and two
-        # simultaneous events render as two stacked lines of subtitles.
-        cursor = float(group[0]["start"])
-        for i, _word in enumerate(group):
-            ev_end = (
-                float(group[i + 1]["start"]) if i + 1 < len(group) else group_end
-            )
-            ev_start = max(0.0, min(cursor, duration))
-            ev_end = max(ev_start + 0.04, min(ev_end, duration))
-            cursor = ev_end
+        # Slots tile exactly. Deriving a start from the *previous* word's end
+        # instead would make consecutive events overlap by the silence between
+        # the words, and two simultaneous events render as two stacked lines.
+        slots = _slots(group)
+        for n, (start, end, active) in enumerate(slots):
+            ev_start = max(0.0, min(start, duration))
+            ev_end = max(ev_start + 0.04, min(end, duration))
             if ev_start >= duration:
                 continue
             events.append(CaptionEvent(
                 start=round(ev_start, 3), end=round(ev_end, 3),
-                tokens=list(tokens), active=i,
+                tokens=list(tokens), active=active,
+                first=n == 0, last=n == len(slots) - 1,
             ))
     return events
 
@@ -169,15 +211,22 @@ def build_ass(
         for j, token in enumerate(event.tokens):
             text = _escape(token)
             if j == event.active:
-                parts.append(f"{{\\c{ACTIVE_COLOUR}\\fscx108\\fscy108}}{text}"
-                             f"{{\\c{IDLE_COLOUR}\\fscx100\\fscy100}}")
+                # Colour only. Scaling the active word changes the line's width,
+                # which re-centres it and makes the text jump sideways on every
+                # word — the single worst source of caption jitter.
+                parts.append(f"{{\\c{ACTIVE_COLOUR}}}{text}{{\\c{IDLE_COLOUR}}}")
             else:
                 parts.append(text)
-        # A fixed 60ms in/out fade eats most of a short event: on fast speech a
-        # word can hold the highlight for only ~140ms, which would leave it
-        # fading for 120ms of that and looking washed out.
-        fade = max(10, min(60, int((event.end - event.start) * 1000 / 4)))
-        body = f"{{\\fad({fade},{fade})}}" + " ".join(parts)
+
+        # Fade in when the phrase appears and out when it leaves, never between
+        # its words: consecutive events carry identical text, so a mid-phrase
+        # fade reads as the line blinking rather than a highlight moving.
+        fade_in = PHRASE_FADE_MS if event.first else 0
+        fade_out = PHRASE_FADE_MS if event.last else 0
+        prefix = (
+            f"{{\\fad({fade_in},{fade_out})}}" if (fade_in or fade_out) else ""
+        )
+        body = prefix + " ".join(parts)
         lines.append(
             f"Dialogue: 0,{_ts(event.start)},{_ts(event.end)},Pop,,0,0,0,,{body}"
         )

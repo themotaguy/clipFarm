@@ -203,29 +203,92 @@ def test_ass_document_has_no_overlapping_dialogue(transcript):
             f"ASS events overlap: {a_start}-{a_end} vs {b_start}-{b_end}"
 
 
-def test_fade_shrinks_for_very_short_events():
-    """A fixed fade would leave a fast-speech caption washed out."""
-    segs = [{
-        "start": 0.0, "end": 2.0, "text": "one two three four five six",
-        "words": [
-            {"word": w, "start": round(i * 0.14, 3), "end": round((i + 1) * 0.14, 3)}
-            for i, w in enumerate("one two three four five six".split())
-        ],
-    }]
-    doc = captions.build_ass(segs, [(0.0, 2.0)])
-    fades = [
-        int(part.split("(")[1].split(",")[0])
-        for part in doc.split("\\fad")[1:]
-    ]
-    assert fades, "no fade tags emitted"
-    assert max(fades) < 60, f"fade not scaled down for short events: {fades}"
-    assert min(fades) >= 10
+# --- flicker control ---
+
+def test_only_phrase_edges_are_flagged(transcript):
+    events = captions.build_events(transcript, [(0.0, 30.0)])
+    assert events
+    # A phrase is a run of events sharing the same tokens.
+    runs = []
+    for event in events:
+        if runs and runs[-1][-1].tokens == event.tokens:
+            runs[-1].append(event)
+        else:
+            runs.append([event])
+    for run in runs:
+        assert run[0].first is True
+        assert run[-1].last is True
+        for middle in run[1:-1]:
+            assert middle.first is False and middle.last is False
 
 
-def test_fade_stays_full_for_comfortable_events(transcript):
-    doc = captions.build_ass(transcript, [(0.0, 40.0)])
-    fades = [
-        int(part.split("(")[1].split(",")[0])
-        for part in doc.split("\\fad")[1:]
+def test_no_fade_between_words_of_a_phrase(transcript):
+    """A fade on every event makes the whole line pulse on each syllable."""
+    doc = captions.build_ass(transcript, [(0.0, 30.0)])
+    dialogues = [l for l in doc.splitlines() if l.startswith("Dialogue:")]
+    assert dialogues
+    faded = [l for l in dialogues if "\\fad(" in l]
+    # Only phrase openings and closings carry a fade, never the words between.
+    assert len(faded) < len(dialogues), "every event still fades"
+    for line in faded:
+        tag = line.split("\\fad(")[1].split(")")[0]
+        fade_in, fade_out = (int(x) for x in tag.split(","))
+        assert fade_in == 0 or fade_out == 0, \
+            "an event fades both in and out, so it never sits at full opacity"
+
+
+def test_active_word_does_not_change_the_line_metrics(transcript):
+    """Scaling the highlighted word re-centres the line and it jumps sideways."""
+    doc = captions.build_ass(transcript, [(0.0, 30.0)])
+    assert "\\fscx" not in doc
+    assert "\\fscy" not in doc
+
+
+def test_highlights_are_long_enough_to_perceive(transcript):
+    events = captions.build_events(transcript, [(0.0, 40.0)])
+    assert events
+    for event in events[:-1]:
+        assert event.end - event.start >= captions.MIN_HIGHLIGHT_SECONDS - 1e-6, \
+            f"{event.end - event.start:.3f}s highlight strobes"
+
+
+def test_short_words_are_absorbed_not_dropped():
+    """Merging a brief slot must keep its text, only move the highlight."""
+    words = [
+        {"word": "you", "start": 0.0, "end": 0.30},
+        {"word": "in", "start": 0.30, "end": 0.36},      # 60ms - too short
+        {"word": "the", "start": 0.36, "end": 0.42},     # 60ms - too short
+        {"word": "room", "start": 0.42, "end": 0.90},
     ]
-    assert max(fades) == 60, "long events should keep the full fade"
+    segs = [{"start": 0.0, "end": 1.0, "text": "you in the room", "words": words}]
+    events = captions.build_events(segs, [(0.0, 1.0)])
+    assert events
+    # All four words stay on screen every time.
+    for event in events:
+        assert event.tokens == ["you", "in", "the", "room"]
+    # But they do not each get their own strobe-length highlight.
+    assert len(events) < 4
+    for event in events:
+        assert event.end - event.start >= captions.MIN_HIGHLIGHT_SECONDS - 1e-6
+
+
+def test_slots_still_tile_after_merging():
+    words = [
+        {"word": f"w{i}", "start": round(i * 0.07, 3), "end": round((i + 1) * 0.07, 3)}
+        for i in range(8)
+    ]
+    slots = captions._slots(words)
+    assert slots
+    for (a_start, a_end, _), (b_start, b_end, _) in zip(slots, slots[1:]):
+        assert abs(b_start - a_end) < 1e-6, "gap or overlap between slots"
+    # Coverage is preserved end to end.
+    assert abs(slots[0][0] - words[0]["start"]) < 1e-6
+    assert abs(slots[-1][1] - words[-1]["end"]) < 1e-6
+
+
+def test_single_word_phrase_survives_the_minimum():
+    words = [{"word": "Wow!", "start": 0.0, "end": 0.05}]
+    segs = [{"start": 0.0, "end": 0.5, "text": "Wow!", "words": words}]
+    events = captions.build_events(segs, [(0.0, 0.5)])
+    assert len(events) == 1
+    assert events[0].tokens == ["Wow!"]

@@ -13,7 +13,7 @@ import threading
 from typing import Any, Sequence
 
 import config
-from app.core import boundaries, context, timeline, topics
+from app.core import ads, boundaries, context, narrative, timeline, topics
 from app.core.chunker import overlap_ratio
 
 # Probe queries. Each targets a different reason a clip gets shared, so a chunk
@@ -50,10 +50,15 @@ spoken sentence with its timestamp.
 
 Judge this excerpt as a candidate standalone short-form clip.
 
-Also choose the tightest in/out points: pick the line where the clip should START \
-(ideally the strongest hook, cutting throat-clearing preamble) and the line where \
-it should END (a clean resolution, not mid-thought). The resulting clip must be \
-between {min_s:.0f} and {max_s:.0f} seconds long.
+Also choose the tightest in/out points. The clip must be between {min_s:.0f} and \
+{max_s:.0f} seconds long, and:
+
+* START on the hook. "start_line" must be the same line as "hook_line" unless \
+the hook genuinely needs one line of run-up. Never open on a request to \
+subscribe or like, on a price or spec recitation, or on admin talk.
+* END after the payoff. If the excerpt builds towards a reveal — "the one more \
+thing", "wait until you see" — the clip must include the reveal itself, not \
+stop on the promise of it.
 
 Lines marked with `>` are the moment to build the clip around. Unmarked lines \
 are surrounding context, shown only so you can pick setup (below) from them.
@@ -72,6 +77,7 @@ Return exactly this JSON shape:
   "setup_start_line": <integer line number or null>,
   "setup_end_line": <integer line number or null>,
   "hook": "the single most scroll-stopping sentence from the excerpt, verbatim",
+  "hook_line": <integer line number the hook is quoted from>,
   "summary": "one sentence describing what the clip is about",
   "hook_strength": 0-10,
   "emotional_impact": 0-10,
@@ -262,6 +268,7 @@ def score_candidate(
     media_duration: float | None = None,
     topic_boundaries: Sequence[float] = (),
     duration_range: tuple[float, float] | None = None,
+    ad_spans: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Grade one candidate with Ollama and refine its in/out points.
 
@@ -296,7 +303,51 @@ def score_candidate(
 
     main = _refine_bounds(lines, data, candidate, (payoff[0], payoff[-1]),
                           duration_range)
-    main = _finish_thought(main, topic_boundaries, duration_range)
+
+    # The scorer names the hook but keeps starting the clip well before it, and
+    # in the worst cases ends *just* before it. Re-anchor onto it.
+    hook_line, hook_score = narrative.locate_hook(
+        _as_text(data.get("hook")), data.get("hook_line"), lines,
+        threshold=config.HOOK_MATCH_THRESHOLD,
+    )
+    hook_applied = False
+    if config.HOOK_ANCHOR and hook_line is not None:
+        # How far we may cut to reach the hook depends on how sure we are of
+        # where it is. A near-exact quote can be trusted to skip a long
+        # preamble; a fuzzy match gets the conservative cap so a mislocated
+        # hook cannot gut the clip.
+        max_trim = (
+            config.HOOK_TRIM_STRONG_SECONDS
+            if hook_score >= config.HOOK_STRONG_MATCH
+            else config.HOOK_TRIM_MAX_SECONDS
+        )
+        anchored = narrative.anchor_to_hook(
+            main, hook_line,
+            run_up=config.HOOK_RUN_UP_SECONDS,
+            max_trim=max_trim,
+            ceiling=_ceiling(duration_range),
+        )
+        hook_applied = anchored != main
+        main = anchored
+
+    main = _finish_thought(main, topic_boundaries, duration_range, ad_spans)
+
+    # Never leave a buildup hanging: if the payoff starts just after the cut,
+    # take it in.
+    reveal_applied = False
+    if config.REVEAL_COMPLETION and words:
+        sentences = context.sentences(words)
+        completed = narrative.complete_reveal(
+            main, sentences,
+            window=config.REVEAL_WINDOW_SECONDS,
+            ceiling=_ceiling(duration_range),
+        )
+        reveal_applied = completed != main
+        main = completed
+        if ad_spans:
+            cleared = ads.clamp_outside(main, ad_spans, min_seconds=2.0)
+            if cleared is not None:
+                main = cleared
 
     # The model's own setup choice wins; a local 8B model almost always says
     # the clip is self-contained, so fall back to detecting the dangling
@@ -311,7 +362,8 @@ def score_candidate(
         )
         setup_source = "auto" if setup else None
 
-    spans = _compose_spans(main, setup, words, media_duration, duration_range)
+    spans = _compose_spans(main, setup, words, media_duration, duration_range,
+                           ad_spans)
     # start/end describe the payoff, so dedupe and seeking stay meaningful even
     # when a setup span is prepended.
     start, end = spans[-1]
@@ -333,6 +385,9 @@ def score_candidate(
         "spans": [{"start": s, "end": e} for s, e in spans],
         "stitched": len(spans) > 1,
         "setup_source": setup_source if len(spans) > 1 else None,
+        "hook_anchored": hook_applied,
+        "reveal_completed": reveal_applied,
+        "hook_at": None if hook_line is None else round(float(hook_line["start"]), 3),
         "duration": round(timeline.total_duration(spans), 3),
         "text": " ".join(l["text"] for l in sub) or candidate["text"],
         "title": _clean_title(data.get("title")) or "Untitled clip",
@@ -345,6 +400,286 @@ def score_candidate(
         # Retrieval agrees on *where* to look; the LLM judges *how good* it is.
         "final_score": round(0.75 * virality + 25.0 * candidate["retrieval_score"], 2),
         "scored_by": config.OLLAMA_MODEL,
+    }
+
+
+CRITIC_SYSTEM = """\
+You are a ruthless short-form editor reviewing a cut someone else made. You \
+answer only with a single JSON object."""
+
+CRITIC_TEMPLATE = """\
+Below are the numbered lines of a long-form transcript. The clip currently runs \
+from line {start_line} to line {end_line}.
+
+--- TRANSCRIPT ---
+{lines}
+--- END TRANSCRIPT ---
+
+The clip's stated hook is: "{hook}"
+
+Review the cut against three rules:
+
+1. It must OPEN on the hook. Opening on a subscribe/like request, a price or \
+spec recitation, or general admin talk is a failure.
+2. It must CONTAIN THE PAYOFF. If the clip builds towards a reveal, it has to \
+include the reveal, not stop on the promise of it.
+3. It must contain no sponsor read or channel housekeeping.
+
+If any rule fails, give the line numbers that would fix it. Keep the clip \
+between {min_s:.0f} and {max_s:.0f} seconds. If the cut is already good, repeat \
+its current line numbers.
+
+Return exactly this JSON object:
+{{
+  "opens_on_hook": true or false,
+  "contains_payoff": true or false,
+  "has_housekeeping": true or false,
+  "suggested_start_line": <integer line number>,
+  "suggested_end_line": <integer line number>,
+  "verdict": "one short sentence"
+}}"""
+
+
+def critique_clip(
+    clip: dict[str, Any],
+    lines: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Ask the model to review a finished cut. Returns None if it cannot.
+
+    Run over the handful of selected clips rather than every candidate, so the
+    extra latency is a few calls instead of a dozen.
+    """
+    if not lines:
+        return None
+
+    start, end = float(clip["start"]), float(clip["end"])
+    inside = [l for l in lines if l["end"] > start and l["start"] < end]
+    if not inside:
+        return None
+
+    prompt = CRITIC_TEMPLATE.format(
+        lines=_format_lines(lines, [l["n"] for l in inside]),
+        start_line=inside[0]["n"],
+        end_line=inside[-1]["n"],
+        hook=_as_text(clip.get("hook"))[:200] or "(none given)",
+        min_s=config.CLIP_MIN_SECONDS,
+        max_s=config.CLIP_MAX_SECONDS,
+    )
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    try:
+        response = get_llm().invoke([
+            SystemMessage(content=CRITIC_SYSTEM),
+            HumanMessage(content=prompt),
+        ])
+    except Exception:      # noqa: BLE001 - the critic is optional by design
+        return None
+
+    content = response.content
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return _parse_json(str(content or ""))
+
+
+# How much of the critic's complaint we can check ourselves. A hook sitting
+# this close to the start is "opening on the hook" whatever the critic says.
+HOOK_AT_START_SECONDS = 2.0
+# Below this, an overlap with a sponsor read or subscribe ask is a rounding
+# error from boundary snapping, not housekeeping the viewer would notice.
+NOTICEABLE_FILLER_SECONDS = 1.0
+
+
+def _clip_profile(
+    spans: Sequence[tuple[float, float]],
+    hook: dict[str, Any] | None,
+    sentences: Sequence[dict[str, Any]],
+    ad_spans: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """The few things about a cut we can judge without asking a model."""
+    start, end = spans[0][0], spans[-1][1]
+    inside = hook is not None and any(
+        s <= float(hook["start"]) and float(hook["end"]) <= e + 0.5
+        for s, e in spans
+    )
+    tail = next((s for s in reversed(sentences)
+                 if float(s["end"]) <= end + 0.5), None)
+    return {
+        "hook_inside": inside,
+        "hook_delay": (float(hook["start"]) - start) if inside else None,
+        "ends_on_promise": bool(tail and narrative.promises_more(tail["text"])),
+        "filler_seconds": sum(ads.overlap_seconds(s, (a["start"], a["end"]))
+                              for s in spans for a in ad_spans),
+        "duration": timeline.total_duration(list(spans)),
+    }
+
+
+def _supported_complaints(
+    verdict: dict[str, Any],
+    spans: Sequence[tuple[float, float]],
+    hook: dict[str, Any] | None,
+    sentences: Sequence[dict[str, Any]],
+    ad_spans: Sequence[dict[str, Any]],
+) -> set[str]:
+    """Keep only the objections our own detectors do not contradict.
+
+    A small local model will flag everything: one 17-minute job came back with
+    the same three failures for all five finalists, "has_housekeeping" included
+    for clips a minute clear of the nearest subscribe ask. Acting on that
+    undoes the rules rather than correcting them.
+    """
+    profile = _clip_profile(spans, hook, sentences, ad_spans)
+    complaints: set[str] = set()
+
+    if not verdict["opens_on_hook"]:
+        # Unlocatable hook = nothing to check it against, so the critic gets
+        # the benefit of the doubt.
+        delay = profile["hook_delay"]
+        if delay is None or delay > HOOK_AT_START_SECONDS:
+            complaints.add("opens_on_hook")
+
+    if not verdict["contains_payoff"]:
+        # We cannot tell a satisfying ending from an unsatisfying one, but we
+        # can tell whether the clip stops on a promise or just short of a
+        # reveal — which is what "missing payoff" means in practice.
+        dangling = profile["ends_on_promise"] or (
+            sentences and narrative.next_reveal(
+                sentences, spans[-1][1], window=config.REVEAL_WINDOW_SECONDS,
+            ) is not None
+        )
+        if dangling:
+            complaints.add("contains_payoff")
+
+    if verdict["has_housekeeping"]:
+        if profile["filler_seconds"] >= NOTICEABLE_FILLER_SECONDS:
+            complaints.add("has_housekeeping")
+
+    return complaints
+
+
+def _is_improvement(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Is the critic's recut better than the span the rules produced?"""
+    if before["hook_inside"] and not after["hook_inside"]:
+        return False
+    if after["ends_on_promise"] and not before["ends_on_promise"]:
+        return False
+    if after["filler_seconds"] > before["filler_seconds"] + 0.5:
+        return False
+
+    delays = (before["hook_delay"], after["hook_delay"])
+    if None not in delays and delays[1] > delays[0] + 1.0:
+        return False       # pushed the hook further from the opening frame
+
+    return (
+        (after["hook_inside"] and not before["hook_inside"])
+        or (None not in delays and delays[1] < delays[0] - 1.0)
+        or (before["ends_on_promise"] and not after["ends_on_promise"])
+        or after["filler_seconds"] < before["filler_seconds"] - 0.5
+    )
+
+
+def apply_critique(
+    clip: dict[str, Any],
+    critique: dict[str, Any] | None,
+    lines: Sequence[dict[str, Any]],
+    *,
+    words: Sequence[dict[str, Any]] = (),
+    media_duration: float | None = None,
+    topic_boundaries: Sequence[float] = (),
+    duration_range: tuple[float, float] | None = None,
+    ad_spans: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """Adopt the critic's bounds only if they measurably improve the clip.
+
+    The critic is advisory, and on real footage it is unreliable in a specific
+    way: `llama3.1:8b` returned the identical all-negative verdict for all five
+    finalists of one job, including "has_housekeeping" for clips a minute away
+    from the nearest subscribe ask. So a review is put through two filters
+    before its bounds are considered at all:
+
+    * **Corroboration** — every complaint it raises that we can measure
+      ourselves is measured. A review whose every checkable claim is
+      contradicted carries no information and is dropped.
+    * **Improvement** — the proposal is profiled next to the span the rules
+      produced (how far in the hook sits, whether it ends on a promise, how
+      much filler it contains) and adopted only if it wins on something
+      without losing on anything else.
+
+    Legality alone is not enough: a three-line suggestion is grown to the
+    minimum duration by `_compose_spans`, which turns a careless proposal into
+    a technically valid clip built from bounds the critic never really chose.
+    """
+    if not critique or not lines:
+        return clip
+
+    verdict = {
+        "opens_on_hook": bool(critique.get("opens_on_hook", True)),
+        "contains_payoff": bool(critique.get("contains_payoff", True)),
+        "has_housekeeping": bool(critique.get("has_housekeeping", False)),
+        "verdict": _as_text(critique.get("verdict"))[:200],
+        "applied": False,
+    }
+    current = [(float(s["start"]), float(s["end"]))
+               for s in (clip.get("spans")
+                         or [{"start": clip["start"], "end": clip["end"]}])]
+    sentences = context.sentences(words) if words else []
+    hook, _score = narrative.locate_hook(
+        _as_text(clip.get("hook")), None, lines,
+        threshold=config.HOOK_MATCH_THRESHOLD,
+    )
+
+    complaints = _supported_complaints(verdict, current, hook, sentences, ad_spans)
+    verdict["upheld"] = sorted(complaints)
+    if not complaints:
+        # Either the critic is happy, or every objection it raised is one we
+        # can measure and have measured as false.
+        return {**clip, "critique": verdict}
+
+    last = len(lines) - 1
+    s_idx = _clamp_index(critique.get("suggested_start_line"), 0, last, default=0)
+    e_idx = _clamp_index(critique.get("suggested_end_line"), 0, last, default=last)
+    if e_idx < s_idx:
+        s_idx, e_idx = e_idx, s_idx
+
+    proposed = (float(lines[s_idx]["start"]), float(lines[e_idx]["end"]))
+    # A window far under the minimum was not chosen as a clip; `_compose_spans`
+    # would grow it to a legal length around bounds the critic never weighed.
+    if proposed[1] - proposed[0] < config.CLIP_MIN_SECONDS * 0.5:
+        return {**clip, "critique": verdict}
+
+    spans = _compose_spans(proposed, None, words, media_duration,
+                           duration_range, ad_spans)
+    if not spans:
+        return {**clip, "critique": verdict}
+
+    total = timeline.total_duration(spans)
+    if not (config.CLIP_MIN_SECONDS <= total <= config.CLIP_MAX_SECONDS):
+        return {**clip, "critique": verdict}
+    if ad_spans and ads.is_advert((spans[0][0], spans[-1][1]), ad_spans,
+                                  threshold=config.AD_OVERLAP_THRESHOLD):
+        return {**clip, "critique": verdict}
+
+    # The recut has to earn its place. Observed failure: the critic reports
+    # "does not contain the payoff", then proposes bounds that still stop on
+    # the buildup and start 12s before the hook — legal, and worse than what
+    # the rules produced.
+    before = _clip_profile(current, hook, sentences, ad_spans)
+    after = _clip_profile(spans, hook, sentences, ad_spans)
+    if not _is_improvement(before, after):
+        return {**clip, "critique": verdict}
+
+    verdict["applied"] = True
+    return {
+        **clip,
+        "start": round(spans[-1][0], 3),
+        "end": round(spans[-1][1], 3),
+        "spans": [{"start": s, "end": e} for s, e in spans],
+        "stitched": len(spans) > 1,
+        "duration": round(total, 3),
+        "critique": verdict,
     }
 
 
@@ -459,6 +794,7 @@ def _finish_thought(
     span: tuple[float, float],
     topic_boundaries: Sequence[float],
     duration_range: tuple[float, float] | None,
+    ad_spans: Sequence[dict[str, Any]] = (),
 ) -> tuple[float, float]:
     """Let a span run on to the end of the thought it started.
 
@@ -467,11 +803,16 @@ def _finish_thought(
     """
     if not config.TOPIC_COMPLETION or not topic_boundaries:
         return span
-    return topics.complete_topic(
+    finished = topics.complete_topic(
         span, topic_boundaries,
         max_extend=config.TOPIC_EXTEND_SECONDS,
         max_seconds=_ceiling(duration_range),
     )
+    if ad_spans:
+        cleared = ads.clamp_outside(finished, ad_spans, min_seconds=2.0)
+        if cleared is not None:
+            return cleared
+    return finished
 
 
 def _ceiling(duration_range: tuple[float, float] | None) -> float:
@@ -540,6 +881,7 @@ def _compose_spans(
     words: Sequence[dict[str, Any]],
     media_duration: float | None,
     duration_range: tuple[float, float] | None = None,
+    ad_spans: Sequence[dict[str, Any]] = (),
 ) -> list[tuple[float, float]]:
     """Snap the main span (and any setup), then fit them inside the length cap."""
     floor = (duration_range or (config.CLIP_MIN_SECONDS,))[0]
@@ -567,6 +909,32 @@ def _compose_spans(
             length = snapped[1] - snapped[0]
         if length >= 1.0:
             spans.insert(0, snapped)
+
+    # Cut out any sponsor read or subscribe ask that falls *inside* a span and
+    # keep what is either side, so a clip is not thrown away — nor truncated to
+    # its useless first few seconds — because of filler in the middle of it.
+    if ad_spans:
+        excised: list[tuple[float, float]] = []
+        for span in spans:
+            excised += ads.subtract(span, ad_spans, min_piece=3.0)
+        if excised:
+            # Re-snap: subtraction cuts at the filler's edge, which is not
+            # necessarily a word or sentence boundary.
+            spans = [
+                _snap(s, words, media_duration, max_seconds=ceiling)
+                for s in excised
+            ]
+            # Excision can leave a fragment: a clip anchored back into a
+            # sponsor read once came out as a 4.5s scrap. Keep the largest
+            # piece and let the minimum-length rule grow it instead.
+            if timeline.total_duration(spans) < floor:
+                longest = max(spans, key=lambda s: s[1] - s[0])
+                spans = [_snap(longest, words, media_duration,
+                               min_seconds=floor, max_seconds=ceiling)]
+                # Growing it may have reached back into the excluded region.
+                regrown = ads.subtract(spans[0], ad_spans, min_piece=3.0)
+                if regrown:
+                    spans = [max(regrown, key=lambda s: s[1] - s[0])]
 
     return timeline.merge_touching(spans)
 

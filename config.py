@@ -56,6 +56,43 @@ DURATION_SPREAD = _flag("DURATION_SPREAD", True)
 # would be far too coarse to locate a moment with.
 WINDOW_MAX_SECONDS = float(os.getenv("WINDOW_MAX_SECONDS", "90"))
 
+# --- sponsor / ad segments ---
+# Integrated ads make tempting clips and worthless ones: scripted, punchy and
+# entirely off-topic. Detected reads are excluded from candidate selection.
+AD_DETECTION = _flag("AD_DETECTION", True)
+# A candidate with at least this fraction inside an ad is discarded.
+AD_OVERLAP_THRESHOLD = float(os.getenv("AD_OVERLAP_THRESHOLD", "0.25"))
+# How far apart two mentions can be and still count as one read.
+AD_GAP_SECONDS = float(os.getenv("AD_GAP_SECONDS", "30"))
+AD_MIN_SECONDS = float(os.getenv("AD_MIN_SECONDS", "6"))
+
+# Channel housekeeping ("hit the subscribe button") is excluded alongside
+# sponsor reads, and excised from the middle of a clip rather than truncating
+# it — the surrounding halves are stitched back together.
+FILLER_DETECTION = _flag("FILLER_DETECTION", True)
+
+# --- narrative shape ---
+# The scorer names the most scroll-stopping sentence but then routinely starts
+# the clip 6-43s earlier, on preamble. These re-anchor the clip onto it.
+HOOK_ANCHOR = _flag("HOOK_ANCHOR", True)
+HOOK_RUN_UP_SECONDS = float(os.getenv("HOOK_RUN_UP_SECONDS", "1.0"))
+# Capped so a badly matched hook cannot gut an otherwise good clip.
+HOOK_TRIM_MAX_SECONDS = float(os.getenv("HOOK_TRIM_MAX_SECONDS", "15"))
+# A near-verbatim hook quote can be trusted to skip a longer preamble; the
+# tighter cap above applies when the hook was only matched fuzzily.
+HOOK_TRIM_STRONG_SECONDS = float(os.getenv("HOOK_TRIM_STRONG_SECONDS", "45"))
+HOOK_STRONG_MATCH = float(os.getenv("HOOK_STRONG_MATCH", "0.85"))
+HOOK_MATCH_THRESHOLD = float(os.getenv("HOOK_MATCH_THRESHOLD", "0.6"))
+
+# Never end on a buildup whose payoff lands just after the cut.
+REVEAL_COMPLETION = _flag("REVEAL_COMPLETION", True)
+REVEAL_WINDOW_SECONDS = float(os.getenv("REVEAL_WINDOW_SECONDS", "25"))
+
+# A second pass over the finalists only, checking they open on the hook and
+# contain the payoff. Advisory: its suggestions must clear the same
+# deterministic gates before they are adopted.
+CRITIC_PASS = _flag("CRITIC_PASS", True)
+
 # --- topic completion ---
 # A clip that stops on a grammatical full stop can still stop mid-argument.
 # These control how far a clip may run on to finish the thought it started.
