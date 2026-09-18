@@ -292,6 +292,16 @@
     media.appendChild(el("span", "clip-time",
       `${hms(clip.start)}–${hms(clip.end)} · ${Math.round(clip.duration)}s`));
 
+    if (clip.stitched && clip.spans?.length > 1) {
+      // A stitched clip is cut from more than one part of the video, so the
+      // single start–end above does not describe it on its own.
+      const badge = el("span", "clip-stitch", `${clip.spans.length} parts`);
+      badge.title = clip.spans
+        .map((s) => `${hms(s.start)}–${hms(s.end)}`)
+        .join("  +  ") + "\nstitched so the clip carries its own setup";
+      media.appendChild(badge);
+    }
+
     if (clip.thumbnail_url) {
       const img = document.createElement("img");
       img.src = clip.thumbnail_url;

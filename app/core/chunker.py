@@ -82,6 +82,9 @@ class WindowBuilder:
         self.overlap = min(max(overlap, 0.0), 0.9)
         self._buf: list[dict[str, Any]] = []
         self._emitted = 0
+        # Ids are handed out per *window*, not per emit call: one oversized emit
+        # can yield several windows and each needs its own Chroma document id.
+        self._next_index = 0
         self._last_span: tuple[float, float] | None = None
 
     def push(self, segment: dict[str, Any]) -> list[dict[str, Any]]:
@@ -187,7 +190,8 @@ class WindowBuilder:
     ) -> dict[str, Any]:
         w_start = float(words[first_word]["start"])
         w_end = float(words[last_word]["end"])
-        index = self._emitted
+        index = self._next_index
+        self._next_index += 1
         return {
             "id": f"chunk-{index:05d}",
             "index": index,

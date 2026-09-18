@@ -83,7 +83,9 @@ def run(job: Job) -> dict[str, Any]:
             if not src_path.exists():
                 raise FileNotFoundError(f"uploaded file vanished: {src_path}")
             reporter.progress(0.7, "Reading uploaded file…")
-            title = src_path.stem
+            # Uploads are saved as `source.<ext>`, so the on-disk stem is useless
+            # as a label — prefer the name the user actually uploaded.
+            title = Path(job.source_label or "").stem or src_path.stem
 
         reporter.check_cancelled()
         reporter.progress(0.75, "Probing streams…")

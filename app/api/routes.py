@@ -12,7 +12,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 from werkzeug.utils import secure_filename
 
 import config
-from app.core import ingest, media, pipeline, transcribe, vectorstore
+from app.core import ingest, media, pipeline, pngcaptions, render, transcribe, vectorstore
 from app.jobs import STAGES, store
 
 bp = Blueprint("api", __name__)
@@ -31,9 +31,35 @@ def index():
 def health():
     checks: dict[str, Any] = {}
 
-    checks["ffmpeg"] = {
-        "ok": media.has_ffmpeg(),
-        "detail": "found on PATH" if media.has_ffmpeg() else "install with `brew install ffmpeg`",
+    if not media.has_ffmpeg():
+        checks["ffmpeg"] = {"ok": False, "detail": "install with `brew install ffmpeg`"}
+    else:
+        binaries = media.resolved_binaries()
+        has_libass = media.has_filter("subtitles")
+        checks["ffmpeg"] = {
+            "ok": True,
+            "detail": f"using {binaries.get('ffmpeg') or 'ffmpeg'}"
+                      + ("" if has_libass else " (no libass; captions fall back "
+                                               "to the built-in renderer)"),
+            "has_libass": has_libass,
+            "binaries": binaries,
+        }
+
+    backend = render.caption_backend(config.BURN_CAPTIONS)
+    checks["captions"] = {
+        # Not being able to draw captions at all is a real problem for a
+        # short-form clipper, so it fails the check rather than warning.
+        "ok": backend != "none" or not config.BURN_CAPTIONS,
+        "detail": {
+            "libass": "burned in by ffmpeg's subtitles filter",
+            "pillow": "drawn with Pillow and composited (ffmpeg lacks libass)",
+            "none": "captions are off"
+                    if not config.BURN_CAPTIONS
+                    else "no renderer available — install Pillow or an ffmpeg with libass",
+        }[backend],
+        "backend": backend,
+        "font": config.CAPTION_FONT,
+        "font_file": pngcaptions.find_font_file() if backend == "pillow" else None,
     }
 
     try:
@@ -78,6 +104,9 @@ def health():
             "clip_seconds": [config.CLIP_MIN_SECONDS, config.CLIP_MAX_SECONDS],
             "resolution": f"{config.RENDER_WIDTH}x{config.RENDER_HEIGHT}",
             "burn_captions": config.BURN_CAPTIONS,
+            "caption_renderer": config.CAPTION_RENDERER,
+            "stitch_setup": config.STITCH_SETUP,
+            "clip_padding": [config.CLIP_LEAD_IN_SECONDS, config.CLIP_TAIL_SECONDS],
         },
         "stages": [{"key": k, "label": lbl} for k, lbl in STAGES],
     })
@@ -206,7 +235,10 @@ def search(job_id: str):
     query = (payload.get("query") or request.args.get("q") or "").strip()
     if not query:
         return jsonify({"error": "`query` is required"}), 400
-    k = max(1, min(int(payload.get("k", 8)), 50))
+    try:
+        k = max(1, min(int(payload.get("k", 8)), 50))
+    except (TypeError, ValueError):
+        return jsonify({"error": "`k` must be an integer between 1 and 50"}), 400
 
     try:
         hits = vectorstore.search_job(job_id, query, k=k)

@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 import config
-from app.core import ingest, render, scoring, transcribe
+from app.core import (
+    boundaries, ingest, render, scoring, timeline, topics, transcribe,
+)
 from app.core.chunker import WindowBuilder
 from app.core.vectorstore import StreamingIndex
 from app.jobs import Job, JobCancelled, StageReporter, store
@@ -74,7 +76,7 @@ def process(job: Job) -> None:
 
     # --- 2 & 3. transcribe, streaming windows into the vector index ---
     index = StreamingIndex(job.id)
-    builder = WindowBuilder()
+    builder = WindowBuilder(max_seconds=config.WINDOW_MAX_SECONDS)
     indexer = BackgroundIndexer(index).start()
     windows: list[dict[str, Any]] = []
 
@@ -148,8 +150,35 @@ def process(job: Job) -> None:
     _check(job)
 
     # --- 5. score ---
+    # Word timings let the scorer move cut points onto real pauses, and are
+    # what keeps clips from ending on a chopped-off word.
+    words = boundaries.flatten_words(segments)
+
+    # Where each thought finishes, so a clip can end on a completed point
+    # rather than merely a completed sentence. The embedding pass reuses the
+    # index's embedder; markers alone still work if it is unavailable.
+    topic_boundaries: list[float] = []
+    if config.TOPIC_COMPLETION:
+        topic_boundaries = topics.find_boundaries(
+            words,
+            embed=getattr(index, "embed_texts", None),
+            threshold=config.TOPIC_SHIFT_THRESHOLD,
+        )
+
+    # Each slot aims at its own slice of the allowed length range, otherwise
+    # every clip comes back about the same length.
+    buckets = (
+        scoring.duration_buckets(config.MAX_CLIPS)
+        if config.DURATION_SPREAD else []
+    )
+
     scored: list[dict[str, Any]] = []
     with StageReporter(job, "score") as rep:
+        if buckets:
+            rep.log("Length targets: " + ", ".join(
+                f"{lo:.0f}-{hi:.0f}s" for lo, hi in buckets))
+        if topic_boundaries:
+            rep.log(f"{len(topic_boundaries)} topic boundaries detected")
         for i, candidate in enumerate(candidates):
             _check(job)
             rep.progress(
@@ -157,9 +186,20 @@ def process(job: Job) -> None:
                 f"Scoring candidate {i + 1}/{len(candidates)} with {config.OLLAMA_MODEL}…",
             )
             try:
+                bucket = buckets[i % len(buckets)] if buckets else None
                 result = scoring.score_candidate(
                     candidate,
-                    scoring.build_lines(segments, candidate["start"], candidate["end"]),
+                    # Padded behind so the model can pull a setup passage, and
+                    # ahead by the bucket's ceiling so a long clip has room.
+                    scoring.build_lines(
+                        segments,
+                        candidate["start"] - config.SETUP_CONTEXT_SECONDS,
+                        candidate["end"] + max(10.0, bucket[1] if bucket else 10.0),
+                    ),
+                    words=words,
+                    media_duration=media_info["duration"],
+                    topic_boundaries=topic_boundaries,
+                    duration_range=bucket,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad candidate must not kill the run
                 rep.log(f"Candidate {i + 1} failed to score: {exc}")
@@ -171,8 +211,13 @@ def process(job: Job) -> None:
             raise ValueError("No candidate could be scored — is Ollama running?")
 
         scored.sort(key=lambda c: c["final_score"], reverse=True)
-        selected = scoring.dedupe_spans(scored, max_overlap=0.35)[: config.MAX_CLIPS]
-        rep.progress(1.0, f"Selected {len(selected)} clips")
+        deduped = scoring.dedupe_spans(scored, max_overlap=0.35)
+        selected = (
+            scoring.spread_by_duration(deduped, config.MAX_CLIPS)
+            if config.DURATION_SPREAD else deduped[: config.MAX_CLIPS]
+        )
+        rep.progress(1.0, f"Selected {len(selected)} clips — " + ", ".join(
+            f"{c['duration']:.0f}s" for c in selected))
     _check(job)
 
     # --- 6. render ---
@@ -187,11 +232,11 @@ def process(job: Job) -> None:
             clip_id = f"clip-{i + 1:02d}"
             rep.progress(i / total, f"Rendering {clip_id} of {total} — “{pick['title']}”")
 
+            spans = pick.get("spans") or [(pick["start"], pick["end"])]
             info = render.render_clip(
                 media_info["video_path"],
                 clip_dir / f"{clip_id}.mp4",
-                pick["start"],
-                pick["end"],
+                spans,
                 segments,
                 has_video=media_info["has_video"],
                 on_progress=lambda frac, i=i: rep.progress((i + frac) / total),
@@ -221,13 +266,29 @@ def process(job: Job) -> None:
                 "srt_url": f"/api/jobs/{job.id}/clips/{clip_id}/srt",
                 **{k: info[k] for k in ("filename", "size_bytes", "width", "height",
                                         "rendered_duration", "path", "thumbnail",
-                                        "subtitles_srt")},
+                                        "subtitles_srt", "captions_burned",
+                                        "caption_backend", "spans", "stitched",
+                                        "fill", "crop", "subject_x")},
             }
+            if info.get("captions_skipped_reason") and i == 0:
+                rep.log(f"Captions not burned in — {info['captions_skipped_reason']}. "
+                        f"Sidecar .srt is still written next to each clip.")
+
             clips.append(clip)
             # Publish incrementally so the UI fills in as each clip lands.
             store.update(job.id, clips=list(clips))
+            stitch_note = ""
+            if info["stitched"]:
+                pieces = " + ".join(f"{s['start']:.0f}-{s['end']:.0f}s"
+                                    for s in info["spans"])
+                stitch_note = f", stitched from {pieces}"
+            fill_note = info["fill"]
+            if info["fill"] == "crop" and info["subject_x"] is not None:
+                fill_note += f" @ {info['subject_x'] * 100:.0f}% width"
             rep.log(f"Rendered {clip_id} — {info['width']}x{info['height']}, "
-                    f"{info['size_bytes'] / 1e6:.1f} MB")
+                    f"{info['size_bytes'] / 1e6:.1f} MB, "
+                    f"captions via {info['caption_backend']}, "
+                    f"{fill_note}{stitch_note}")
 
         rep.progress(1.0, f"{len(clips)} clips rendered")
 

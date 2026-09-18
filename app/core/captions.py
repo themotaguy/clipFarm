@@ -1,14 +1,21 @@
-"""Word-timed ASS subtitles for burned-in captions.
+"""Word-timed captions for burned-in subtitles.
 
-Whisper gives per-word timestamps, so instead of static blocks we emit one event
-per word: the phrase stays on screen while the word being spoken is recoloured.
-That is the look short-form audiences expect.
+Whisper gives per-word timestamps, so instead of static blocks we emit one
+event per word: the phrase stays on screen while the word being spoken is
+recoloured. That is the look short-form audiences expect.
+
+The word grouping and highlighting live in `build_events`, which both burn-in
+backends share — libass (`subtitles=`) and the Pillow renderer in
+`pngcaptions` — so captions look the same however they get drawn.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
+
+from app.core import timeline
 
 MAX_WORDS_PER_GROUP = 4
 MAX_CHARS_PER_GROUP = 24
@@ -16,6 +23,10 @@ MAX_CHARS_PER_GROUP = 24
 # ASS colours are &HBBGGRR (not RGB).
 IDLE_COLOUR = "&H00FFFFFF&"      # white
 ACTIVE_COLOUR = "&H0047E3FF&"    # amber
+
+#: RGB equivalents, for backends that draw the text themselves.
+IDLE_RGB = (255, 255, 255)
+ACTIVE_RGB = (255, 227, 71)
 
 ASS_HEADER = """\
 [Script Info]
@@ -35,28 +46,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
+@dataclass
+class CaptionEvent:
+    """One on-screen phrase, with the word currently being spoken marked."""
+
+    start: float
+    end: float
+    tokens: list[str] = field(default_factory=list)
+    active: int = 0
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.tokens)
+
+
 def collect_words(
-    segments: Sequence[dict[str, Any]],
-    start: float,
-    end: float,
+    segments: Iterable[dict[str, Any]],
+    spans: Sequence[timeline.Span],
 ) -> list[dict[str, Any]]:
-    """Words falling inside [start, end], with times rebased to the clip."""
-    words: list[dict[str, Any]] = []
-    for seg in segments:
-        if seg["end"] <= start or seg["start"] >= end:
-            continue
-        for w in seg.get("words") or []:
-            if w["end"] <= start or w["start"] >= end:
-                continue
-            token = (w.get("word") or "").strip()
-            if not token:
-                continue
-            words.append({
-                "word": token,
-                "start": max(0.0, float(w["start"]) - start),
-                "end": max(0.0, min(float(w["end"]), end) - start),
-            })
-    return words
+    """Words inside `spans`, with times rebased onto the clip timeline."""
+    return timeline.words_in_spans(segments, timeline.normalize(spans))
 
 
 def _group(words: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -82,19 +91,63 @@ def _group(words: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return groups
 
 
+def build_events(
+    segments: Iterable[dict[str, Any]],
+    spans: Sequence[timeline.Span],
+    *,
+    duration: float | None = None,
+) -> list[CaptionEvent]:
+    """Word-by-word caption events on the clip timeline.
+
+    Events are tiled edge to edge within a phrase so it never flickers between
+    words, and clamped to the clip duration.
+    """
+    spans = timeline.normalize(spans)
+    words = collect_words(segments, spans)
+    if duration is None:
+        duration = timeline.total_duration(spans)
+    duration = max(0.1, duration)
+
+    events: list[CaptionEvent] = []
+    for group in _group(words):
+        tokens = [w["word"] for w in group]
+        group_end = max(w["end"] for w in group)
+        # Each word holds the highlight until the next one starts, so events
+        # tile exactly: the phrase never flickers and never doubles up.
+        #
+        # Deriving the start from the *previous* word's end instead would make
+        # consecutive events overlap by the silence between the words, and two
+        # simultaneous events render as two stacked lines of subtitles.
+        cursor = float(group[0]["start"])
+        for i, _word in enumerate(group):
+            ev_end = (
+                float(group[i + 1]["start"]) if i + 1 < len(group) else group_end
+            )
+            ev_start = max(0.0, min(cursor, duration))
+            ev_end = max(ev_start + 0.04, min(ev_end, duration))
+            cursor = ev_end
+            if ev_start >= duration:
+                continue
+            events.append(CaptionEvent(
+                start=round(ev_start, 3), end=round(ev_end, 3),
+                tokens=list(tokens), active=i,
+            ))
+    return events
+
+
 def build_ass(
-    segments: Sequence[dict[str, Any]],
-    start: float,
-    end: float,
+    segments: Iterable[dict[str, Any]],
+    spans: Sequence[timeline.Span],
     *,
     width: int = 1080,
     height: int = 1920,
-    font: str = "Arial Black",
+    font: str | None = None,
+    duration: float | None = None,
 ) -> str:
-    """Render an ASS subtitle document for the clip spanning [start, end]."""
-    words = collect_words(segments, start, end)
-    duration = max(0.1, end - start)
+    """Render an ASS subtitle document for the clip made of `spans`."""
+    import config
 
+    font = font or config.CAPTION_FONT
     size = max(40, int(height * 0.048))
     header = ASS_HEADER.format(
         width=width,
@@ -105,33 +158,31 @@ def build_ass(
         margin_h=int(width * 0.09),
         margin_v=int(height * 0.16),
     )
-    if not words:
+
+    events = build_events(segments, spans, duration=duration)
+    if not events:
         return header
 
-    events: list[str] = []
-    for group in _group(words):
-        group_end = max(w["end"] for w in group)
-        for i, word in enumerate(group):
-            ev_start = word["start"] if i == 0 else group[i - 1]["end"]
-            # Tile events edge to edge so the phrase never flickers between words.
-            ev_end = group[i + 1]["start"] if i + 1 < len(group) else group_end
-            ev_start = max(0.0, min(ev_start, duration))
-            ev_end = max(ev_start + 0.04, min(ev_end, duration))
+    lines: list[str] = []
+    for event in events:
+        parts = []
+        for j, token in enumerate(event.tokens):
+            text = _escape(token)
+            if j == event.active:
+                parts.append(f"{{\\c{ACTIVE_COLOUR}\\fscx108\\fscy108}}{text}"
+                             f"{{\\c{IDLE_COLOUR}\\fscx100\\fscy100}}")
+            else:
+                parts.append(text)
+        # A fixed 60ms in/out fade eats most of a short event: on fast speech a
+        # word can hold the highlight for only ~140ms, which would leave it
+        # fading for 120ms of that and looking washed out.
+        fade = max(10, min(60, int((event.end - event.start) * 1000 / 4)))
+        body = f"{{\\fad({fade},{fade})}}" + " ".join(parts)
+        lines.append(
+            f"Dialogue: 0,{_ts(event.start)},{_ts(event.end)},Pop,,0,0,0,,{body}"
+        )
 
-            parts = []
-            for j, other in enumerate(group):
-                text = _escape(other["word"])
-                if j == i:
-                    parts.append(f"{{\\c{ACTIVE_COLOUR}\\fscx108\\fscy108}}{text}"
-                                 f"{{\\c{IDLE_COLOUR}\\fscx100\\fscy100}}")
-                else:
-                    parts.append(text)
-            body = "{\\fad(60,60)}" + " ".join(parts)
-            events.append(
-                f"Dialogue: 0,{_ts(ev_start)},{_ts(ev_end)},Pop,,0,0,0,,{body}"
-            )
-
-    return header + "\n".join(events) + "\n"
+    return header + "\n".join(lines) + "\n"
 
 
 def write_ass(path: str | Path, content: str) -> Path:

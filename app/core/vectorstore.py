@@ -71,6 +71,8 @@ class StreamingIndex:
         self._lock = threading.Lock()
         self._count = 0
 
+        self._embedder = _make_embedding_function()
+
         client = get_client()
         # Start clean so a re-run of the same job id never mixes in stale vectors.
         try:
@@ -79,9 +81,19 @@ class StreamingIndex:
             pass
         self.collection = client.create_collection(
             name=self.collection_name,
-            embedding_function=_make_embedding_function(),
+            embedding_function=self._embedder,
             metadata={"hnsw:space": "cosine", "job_id": job_id},
         )
+
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        """Embed arbitrary text with this job's embedder.
+
+        Used by the topic-boundary pass, which needs sentence-level vectors
+        rather than the window vectors stored in the collection.
+        """
+        if not texts:
+            return []
+        return [list(v) for v in self._embedder(list(texts))]
 
     @property
     def count(self) -> int:

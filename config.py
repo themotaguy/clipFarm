@@ -42,20 +42,77 @@ OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
 # --- clip shaping ---
-CLIP_MIN_SECONDS = float(os.getenv("CLIP_MIN_SECONDS", "18"))
-CLIP_MAX_SECONDS = float(os.getenv("CLIP_MAX_SECONDS", "75"))
+CLIP_MIN_SECONDS = float(os.getenv("CLIP_MIN_SECONDS", "15"))
+CLIP_MAX_SECONDS = float(os.getenv("CLIP_MAX_SECONDS", "180"))
 CLIP_TARGET_SECONDS = float(os.getenv("CLIP_TARGET_SECONDS", "45"))
 MAX_CLIPS = int(os.getenv("MAX_CLIPS", "5"))
 SCORE_CANDIDATES = int(os.getenv("SCORE_CANDIDATES", "14"))
+
+# Spread the selected clips across the allowed length range instead of letting
+# them all cluster near the target: each slot gets its own duration bucket.
+DURATION_SPREAD = _flag("DURATION_SPREAD", True)
+
+# Retrieval windows stay short regardless of CLIP_MAX_SECONDS — a 180s window
+# would be far too coarse to locate a moment with.
+WINDOW_MAX_SECONDS = float(os.getenv("WINDOW_MAX_SECONDS", "90"))
+
+# --- topic completion ---
+# A clip that stops on a grammatical full stop can still stop mid-argument.
+# These control how far a clip may run on to finish the thought it started.
+TOPIC_COMPLETION = _flag("TOPIC_COMPLETION", True)
+TOPIC_EXTEND_SECONDS = float(os.getenv("TOPIC_EXTEND_SECONDS", "45"))
+# Cosine similarity below this between neighbouring passages = topic shift.
+TOPIC_SHIFT_THRESHOLD = float(os.getenv("TOPIC_SHIFT_THRESHOLD", "0.62"))
 
 # Vector layer: chunks are flushed to Chroma in batches this size as the
 # transcript streams in, so retrieval is warm before transcription finishes.
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
 
+# --- cut points ---
+# Boundaries handed over by the LLM land on word edges, which sounds severed.
+# These control how far a cut may move to find real silence to land in.
+CLIP_LEAD_IN_SECONDS = float(os.getenv("CLIP_LEAD_IN_SECONDS", "0.25"))
+CLIP_TAIL_SECONDS = float(os.getenv("CLIP_TAIL_SECONDS", "0.6"))
+# Asymmetric on purpose: reaching forward to let a sentence finish is cheap,
+# cutting backwards throws away a moment the scorer chose.
+# 10s measured best on real footage: 15/15 clips ended on a sentence versus
+# 13/15 at 6s, for only ~1.6s of added length on average.
+CLIP_SNAP_EXTEND = float(os.getenv("CLIP_SNAP_EXTEND", "10.0"))
+CLIP_SNAP_TRUNCATE = float(os.getenv("CLIP_SNAP_TRUNCATE", "1.5"))
+CLIP_MIN_PAUSE = float(os.getenv("CLIP_MIN_PAUSE", "0.18"))
+
+# --- stitching ---
+# A clip may prepend one earlier "setup" span when the payoff depends on
+# context stated before it. The model is shown this much extra transcript
+# either side of the candidate so it has something to choose from.
+STITCH_SETUP = _flag("STITCH_SETUP", True)
+SETUP_MAX_SECONDS = float(os.getenv("SETUP_MAX_SECONDS", "20"))
+SETUP_CONTEXT_SECONDS = float(os.getenv("SETUP_CONTEXT_SECONDS", "60"))
+
 # --- render ---
 RENDER_WIDTH = int(os.getenv("RENDER_WIDTH", "1080"))
 RENDER_HEIGHT = int(os.getenv("RENDER_HEIGHT", "1920"))
+
+# How a landscape source is fitted to the vertical canvas.
+#   crop - fill the frame by cropping, tracking the main subject (default)
+#   blur - letterbox the whole frame over a blurred copy of itself
+#   auto - crop when a subject can be located, else blur
+RENDER_FILL = os.getenv("RENDER_FILL", "crop").strip().lower()
+# Sample this many frames per span when locating the subject.
+FRAMING_SAMPLES = int(os.getenv("FRAMING_SAMPLES", "12"))
 BURN_CAPTIONS = _flag("BURN_CAPTIONS", True)
+# auto   - libass if this ffmpeg has it, else the built-in Pillow renderer
+# libass - require ffmpeg's subtitles filter
+# pillow - always draw captions ourselves
+# none   - equivalent to BURN_CAPTIONS=false
+CAPTION_RENDERER = os.getenv("CAPTION_RENDERER", "auto").strip().lower()
+CAPTION_FONT = os.getenv("CAPTION_FONT", "Arial Black")
+
+# Point these at a specific build (e.g. Homebrew's keg-only `ffmpeg-full`,
+# which unlike plain `ffmpeg` ships with libass). Blank = search PATH, and
+# prefer a libass-capable build if the one on PATH cannot burn captions.
+FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "").strip()
+FFPROBE_BINARY = os.getenv("FFPROBE_BINARY", "").strip()
 
 # --- server ---
 FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1")

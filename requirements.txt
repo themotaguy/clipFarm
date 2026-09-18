@@ -15,6 +15,9 @@ langchain-core>=0.3
 langchain-text-splitters>=0.3
 langchain-ollama>=0.2
 
+# --- caption rendering (fallback when ffmpeg lacks libass) ---
+Pillow>=10.0
+
 # --- misc ---
 pydantic>=2.7
 requests>=2.31
