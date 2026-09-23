@@ -18,6 +18,14 @@ langchain-ollama>=0.2
 # --- caption rendering (fallback when ffmpeg lacks libass) ---
 Pillow>=10.0
 
+# --- speaker-aware framing (optional) ---
+# Face detection for following the talker in a shot holding two people.
+# Headless on purpose: no GUI libraries wanted on a server, and it is only
+# ever imported by the detection subprocess (see app/core/facedetect.py),
+# never by the process running Whisper. Without it, framing still works —
+# it just falls back to re-framing on each cut.
+opencv-python-headless>=4.9
+
 # --- misc ---
 pydantic>=2.7
 requests>=2.31

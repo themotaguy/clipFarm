@@ -22,6 +22,7 @@ DNN detector needs a model downloaded at runtime; this needs nothing but numpy.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -205,6 +206,138 @@ def find_subject_x(
         return best_window(scores, window)
     finally:
         shutil.rmtree(frame_dir, ignore_errors=True)
+
+
+#: Scene-change score above which two consecutive frames are a cut. 0.35 was
+#: measured on real footage: it found all four cuts in a 95s talking-head clip
+#: with b-roll inserts and no false positives on camera moves.
+SCENE_THRESHOLD = 0.35
+
+#: A "shot" shorter than this is folded into its neighbour. Re-framing for a
+#: flash of b-roll is more distracting than leaving the crop where it was.
+MIN_SHOT_SECONDS = 1.5
+
+#: Shots whose subject sits within this fraction of the frame width of the
+#: previous one keep the previous crop, so the frame does not twitch between
+#: two near-identical positions.
+MIN_SHIFT = 0.02
+
+#: Frames to analyse per shot regardless of how short it is. Splitting the
+#: clip's budget strictly by duration left short shots on three frames, and at
+#: that point the estimate is noise — two shots framed 12% apart came back
+#: identical and were wrongly merged.
+MIN_SHOT_SAMPLES = 6
+
+
+def find_shots(
+    source: str | Path,
+    span: timeline.Span,
+    *,
+    threshold: float = SCENE_THRESHOLD,
+) -> list[float]:
+    """Cut points inside `span`, in seconds from the span's start.
+
+    One static crop across a whole clip is wrong as soon as the edit cuts: the
+    presenter moves, or the shot changes to b-roll framed completely
+    differently. Detection runs on downscaled frames — a cut is a cut at 320px.
+    """
+    start, end = float(span[0]), float(span[1])
+    if end - start <= MIN_SHOT_SECONDS:
+        return []
+    try:
+        proc = subprocess.run(
+            [media.binary("ffmpeg"), "-y", "-hide_banner", "-nostats",
+             "-ss", f"{max(start, 0):.3f}", "-t", f"{end - start:.3f}",
+             "-i", str(source), "-an",
+             "-filter:v", f"scale={SAMPLE_WIDTH}:-2,"
+                          f"select='gt(scene,{threshold})',showinfo",
+             "-f", "null", "-"],
+            capture_output=True, timeout=300, check=False, text=True,
+        )
+    except (subprocess.SubprocessError, OSError, media.MediaError):
+        return []
+
+    cuts: list[float] = []
+    for match in re.finditer(r"pts_time:([0-9.]+)", proc.stderr or ""):
+        try:
+            cuts.append(float(match.group(1)))
+        except ValueError:
+            continue
+    return sorted(t for t in cuts if MIN_SHOT_SECONDS < t < (end - start))
+
+
+def _shot_bounds(length: float, cuts: Sequence[float]) -> list[timeline.Span]:
+    """Turn cut points into [start, end) shots, dropping the very short ones."""
+    edges = [0.0] + [c for c in cuts if 0.0 < c < length] + [length]
+    shots: list[timeline.Span] = []
+    for a, b in zip(edges, edges[1:]):
+        if b - a < MIN_SHOT_SECONDS and shots:
+            shots[-1] = (shots[-1][0], b)       # fold a flash into its neighbour
+        elif b - a > 0:
+            shots.append((a, b))
+    if len(shots) > 1 and shots[0][1] - shots[0][0] < MIN_SHOT_SECONDS:
+        shots[1] = (shots[0][0], shots[1][1])
+        shots.pop(0)
+    return shots
+
+
+def find_subject_track(
+    source: str | Path,
+    span: timeline.Span,
+    *,
+    window: float,
+    samples: int,
+    work_dir: str | Path,
+    threshold: float = SCENE_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Where to centre the crop over the course of one span, shot by shot.
+
+    Returns `[{"start": s, "end": e, "x": 0..1}, ...]` with times measured from
+    the start of the span, which is what the renderer's `t` is relative to.
+    Consecutive shots that want near-identical crops are merged, so the result
+    is often a single entry — the same answer `find_subject_x` would give.
+    """
+    start, end = float(span[0]), float(span[1])
+    length = end - start
+    if length <= 0:
+        return []
+
+    shots = _shot_bounds(length, find_shots(source, span, threshold=threshold))
+    if len(shots) <= 1:
+        x = find_subject_x(source, [(start, end)], window=window,
+                           samples=samples, work_dir=work_dir)
+        return [] if x is None else [{"start": 0.0, "end": length, "x": x}]
+
+    track: list[dict[str, Any]] = []
+    for a, b in shots:
+        # Spend the sample budget in proportion to how long each shot lasts,
+        # on top of a floor that keeps a brief shot from being guessed at.
+        count = max(MIN_SHOT_SAMPLES, int(round(samples * (b - a) / length)))
+        x = find_subject_x(source, [(start + a, start + b)], window=window,
+                           samples=count, work_dir=work_dir)
+        if x is None:
+            x = track[-1]["x"] if track else 0.5
+        if track and abs(x - track[-1]["x"]) < MIN_SHIFT:
+            track[-1]["end"] = b                # not worth moving the frame
+            continue
+        track.append({"start": a, "end": b, "x": x})
+    return track
+
+
+def average_x(tracks: Sequence[Sequence[dict[str, Any]]]) -> float | None:
+    """Duration-weighted mean crop centre across every shot of every span.
+
+    Used as the clip's single reported position, and as the fallback when the
+    renderer needs one static box.
+    """
+    weight = 0.0
+    total = 0.0
+    for track in tracks:
+        for entry in track:
+            length = max(float(entry["end"]) - float(entry["start"]), 0.0)
+            weight += length
+            total += length * float(entry["x"])
+    return None if weight <= 0 else total / weight
 
 
 def crop_geometry(

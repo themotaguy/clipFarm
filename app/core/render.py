@@ -18,9 +18,11 @@ from typing import Any, Callable, Sequence
 
 import config
 from app.core import captions as captions_mod
+from app.core import boundaries
 from app.core import framing
 from app.core import media
 from app.core import pngcaptions
+from app.core import speakers
 from app.core import timeline
 from app.core import transcribe as transcribe_mod
 
@@ -94,16 +96,35 @@ def _blur_fill(index: int, width: int, height: int, tag: str) -> tuple[str, str]
     return chain, label
 
 
+def _crop_x_expression(track: Sequence[dict[str, Any]]) -> str:
+    """An ffmpeg expression stepping the crop to each shot's subject.
+
+    The steps land exactly on cuts, where the whole picture changes anyway, so
+    a hard jump reads as part of the edit rather than as the camera lurching.
+    """
+    expression = str(int(track[-1]["x"]))
+    for i in range(len(track) - 1, 0, -1):
+        cut = float(track[i]["start"])
+        expression = (f"if(lt(t,{cut:.3f}),{int(track[i - 1]['x'])},{expression})")
+    return expression
+
+
 def _crop_fill(
     index: int,
     width: int,
     height: int,
     tag: str,
     box: dict[str, int] | None,
+    track: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     """Fill the canvas by cropping — no blurred bars, subject kept in shot."""
     label = f"v{tag}"
-    if box:
+    if box and track and len(track) > 1:
+        # Quoted so the commas inside the expression are not read as filter
+        # separators by the filtergraph parser.
+        crop = (f"crop=w={box['width']}:h={box['height']}"
+                f":x='{_crop_x_expression(track)}':y={box['y']}")
+    elif box:
         crop = (f"crop=w={box['width']}:h={box['height']}"
                 f":x={box['x']}:y={box['y']}")
     else:
@@ -125,10 +146,11 @@ def _composite_video(
     *,
     mode: str = "blur",
     box: dict[str, int] | None = None,
+    track: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     """Fit one span onto the vertical canvas using the chosen fill mode."""
     if mode == "crop":
-        return _crop_fill(index, width, height, tag, box)
+        return _crop_fill(index, width, height, tag, box, track)
     return _blur_fill(index, width, height, tag)
 
 
@@ -145,6 +167,7 @@ def _build_graph(
     caption_offset: int,
     fill_mode: str = "blur",
     crop_box: dict[str, int] | None = None,
+    crop_tracks: Sequence[Sequence[dict[str, Any]]] | None = None,
 ) -> str:
     """Whole filtergraph: per-span composite, concat, then captions."""
     parts: list[str] = []
@@ -154,8 +177,10 @@ def _build_graph(
         idx = span_offset + i
         tag = str(i)
         if has_video:
+            track = crop_tracks[i] if crop_tracks and i < len(crop_tracks) else None
             chain, vlabel = _composite_video(idx, width, height, tag,
-                                             mode=fill_mode, box=crop_box)
+                                             mode=fill_mode, box=crop_box,
+                                             track=track)
             parts.append(chain)
             parts.append(f"[{idx}:a]{_AFMT},asetpts=PTS-STARTPTS[a{tag}]")
         else:
@@ -195,6 +220,50 @@ def _build_graph(
         parts.append(f"[{stage}]null[vout]")
 
     return ";".join(parts)
+
+
+def _subject_track(
+    source: str | Path,
+    span: timeline.Span,
+    words: Sequence[dict[str, Any]],
+    *,
+    window: float,
+    work_dir: str | Path,
+) -> list[dict[str, Any]]:
+    """Where to centre the crop through one span, shot by shot and speaker by
+    speaker.
+
+    Per-shot framing is the base layer and handles every cut. Inside a shot
+    long enough to hold a conversation, speaker tracking gets a chance to
+    subdivide it further — that is the only thing that helps a locked-off
+    two-shot, where no cut ever happens and detail-and-motion scoring lands
+    between the two faces.
+    """
+    track = framing.find_subject_track(
+        source, span, window=window,
+        samples=config.FRAMING_SAMPLES, work_dir=work_dir,
+    )
+    if not track or not config.SPEAKER_TRACKING or not words:
+        return track
+
+    refined: list[dict[str, Any]] = []
+    for entry in track:
+        shot = (float(span[0]) + entry["start"], float(span[0]) + entry["end"])
+        if shot[1] - shot[0] < speakers.MIN_SHOT_SECONDS:
+            refined.append(entry)
+            continue
+        found = speakers.find_speaker_track(source, shot, words,
+                                            work_dir=work_dir)
+        if not found:
+            refined.append(entry)      # one face, or nothing conclusive
+            continue
+        for piece in found:
+            refined.append({
+                "start": entry["start"] + piece["start"],
+                "end": entry["start"] + piece["end"],
+                "x": piece["x"],
+            })
+    return refined
 
 
 def render_clip(
@@ -251,17 +320,41 @@ def render_clip(
     crop_box: dict[str, int] | None = None
     subject_x: float | None = None
 
+    crop_tracks: list[list[dict[str, Any]]] = []
+
     if has_video and fill_mode in {"crop", "auto"}:
         probe = media.probe(source)
         src_w, src_h = int(probe.get("width") or 0), int(probe.get("height") or 0)
         if src_w and src_h:
-            subject_x = framing.find_subject_x(
-                source, spans,
-                window=framing.window_fraction(src_w, src_h, width, height),
-                samples=config.FRAMING_SAMPLES,
-                work_dir=work_dir,
-            )
+            window = framing.window_fraction(src_w, src_h, width, height)
+            if config.FRAMING_PER_SHOT:
+                # One crop per shot rather than one per clip: an edit that cuts
+                # to b-roll, or to the other person in the room, reframes on
+                # the cut instead of keeping a compromise position all the way
+                # through.
+                words = boundaries.flatten_words(segments)
+                crop_tracks = [
+                    _subject_track(source, span, words, window=window,
+                                   work_dir=work_dir)
+                    for span in spans
+                ]
+                subject_x = framing.average_x(crop_tracks)
+            else:
+                subject_x = framing.find_subject_x(
+                    source, spans, window=window,
+                    samples=config.FRAMING_SAMPLES, work_dir=work_dir,
+                )
             crop_box = framing.crop_geometry(src_w, src_h, width, height, subject_x)
+            # Expressions need pixel positions, so resolve each shot's centre
+            # against the same box the static path would have produced.
+            if crop_box:
+                for track in crop_tracks:
+                    for entry in track:
+                        shot_box = framing.crop_geometry(
+                            src_w, src_h, width, height, entry["x"])
+                        entry["x"] = (shot_box or crop_box)["x"]
+            else:
+                crop_tracks = []
         if fill_mode == "auto" and subject_x is None:
             fill_mode = "blur"
         elif fill_mode == "auto":
@@ -305,7 +398,7 @@ def render_clip(
             subtitle_file=subtitle_arg, overlays=overlays,
             color_input=color_input, span_offset=span_offset,
             caption_offset=caption_offset, fill_mode=fill_mode,
-            crop_box=crop_box,
+            crop_box=crop_box, crop_tracks=crop_tracks,
         ),
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -339,6 +432,10 @@ def render_clip(
         "stitched": len(spans) > 1,
         "fill": fill_mode,
         "crop": crop_box,
+        "crop_track": [
+            [{"start": round(e["start"], 2), "x": e["x"]} for e in track]
+            for track in crop_tracks
+        ] or None,
         "subject_x": None if subject_x is None else round(subject_x, 4),
         "captions_burned": backend != "none",
         "caption_backend": backend,

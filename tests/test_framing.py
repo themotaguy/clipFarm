@@ -8,7 +8,8 @@ from app.core import framing, media
 pytestmark = pytest.mark.skipif(not media.has_ffmpeg(), reason="ffmpeg not on PATH")
 
 
-def _subject_video(path, subject_x_fraction: float, duration: int = 6):
+def _subject_video(path, subject_x_fraction: float, duration: int = 6,
+                   bg: str = "0x101010"):
     """A dark frame with a detailed, moving 'subject' at a known position.
 
     testsrc2 supplies texture and motion; the rest of the frame is flat, which
@@ -19,7 +20,7 @@ def _subject_video(path, subject_x_fraction: float, duration: int = 6):
     x = int(subject_x_fraction * w - sub_w / 2)
     media.run([
         media.binary("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", f"color=c=0x101010:s={w}x{h}:r=10:d={duration}",
+        "-f", "lavfi", "-i", f"color=c={bg}:s={w}x{h}:r=10:d={duration}",
         "-f", "lavfi", "-i", f"testsrc2=s={sub_w}x400:r=10:d={duration}",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
         "-filter_complex", f"[0:v][1:v]overlay={x}:160:format=auto[v]",
@@ -148,3 +149,99 @@ def test_find_subject_cleans_up_its_frames(tmp_path):
     framing.find_subject_x(video, [(0.5, 5.5)], window=framing.window_fraction(1280, 720, 1080, 1920), samples=4,
                            work_dir=tmp_path)
     assert not (tmp_path / "_framing").exists()
+
+
+# --- per-shot framing ---
+
+def _two_shot_video(path, first_x: float, second_x: float, duration: int = 8):
+    """A video that cuts halfway from a subject at `first_x` to one at `second_x`.
+
+    The two halves are lit differently on purpose. A real cut replaces the
+    whole frame, and scene detection scores whole-frame change: two shots that
+    differ only by where a small block sits score about 0.02, well under any
+    sane threshold, which makes for a fixture that tests nothing.
+    """
+    half = duration // 2
+    parts = []
+    for i, (frac, bg) in enumerate(((first_x, "0x101010"),
+                                    (second_x, "0x606060"))):
+        piece = path.parent / f"part-{i}.mp4"
+        _subject_video(piece, frac, duration=half, bg=bg)
+        parts.append(piece)
+    listing = path.parent / "parts.txt"
+    listing.write_text("".join(f"file '{p.name}'\n" for p in parts))
+    media.run([
+        media.binary("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(listing),
+        "-c", "copy", str(path),
+    ])
+    return path
+
+
+def test_shot_bounds_folds_away_a_flash():
+    """A half-second insert is not worth re-framing for."""
+    shots = framing._shot_bounds(30.0, [10.0, 10.4, 20.0])
+    assert shots == [(0.0, 10.4), (10.4, 20.0), (20.0, 30.0)]
+
+
+def test_shot_bounds_with_no_cuts_is_one_shot():
+    assert framing._shot_bounds(30.0, []) == [(0.0, 30.0)]
+
+
+def test_shot_bounds_ignores_cuts_outside_the_span():
+    shots = framing._shot_bounds(20.0, [-3.0, 8.0, 99.0])
+    assert shots == [(0.0, 8.0), (8.0, 20.0)]
+
+
+def test_shot_bounds_merges_a_short_opening_shot():
+    shots = framing._shot_bounds(20.0, [0.6])
+    assert shots == [(0.0, 20.0)]
+
+
+def test_average_x_weights_by_duration():
+    track = [{"start": 0.0, "end": 90.0, "x": 0.4},
+             {"start": 90.0, "end": 100.0, "x": 0.9}]
+    assert abs(framing.average_x([track]) - 0.45) < 1e-6
+
+
+def test_average_x_is_none_without_a_track():
+    assert framing.average_x([]) is None
+    assert framing.average_x([[]]) is None
+
+
+def test_find_shots_locates_a_cut(tmp_path):
+    video = _two_shot_video(tmp_path / "cut.mp4", 0.2, 0.8, duration=8)
+    cuts = framing.find_shots(video, (0.0, 8.0))
+    assert cuts, "the cut halfway through was not detected"
+    assert any(abs(c - 4.0) < 1.0 for c in cuts), cuts
+
+
+def test_track_follows_the_subject_across_a_cut(tmp_path):
+    """The point of the whole exercise: one crop per shot, not per clip."""
+    video = _two_shot_video(tmp_path / "cut.mp4", 0.2, 0.8, duration=8)
+    track = framing.find_subject_track(
+        video, (0.0, 8.0), window=0.3, samples=12, work_dir=tmp_path,
+    )
+    assert len(track) == 2, f"expected a move on the cut, got {track}"
+    assert track[0]["x"] < 0.5 < track[1]["x"], track
+    assert track[0]["start"] == 0.0
+
+
+def test_track_stays_put_when_the_subject_does_not_move(tmp_path):
+    """A cut between two identically framed shots must not twitch the crop."""
+    video = _two_shot_video(tmp_path / "same.mp4", 0.3, 0.3, duration=8)
+    track = framing.find_subject_track(
+        video, (0.0, 8.0), window=0.3, samples=12, work_dir=tmp_path,
+    )
+    assert len(track) == 1, f"crop moved for no reason: {track}"
+
+
+def test_track_covers_the_whole_span(tmp_path):
+    video = _two_shot_video(tmp_path / "cut.mp4", 0.2, 0.8, duration=8)
+    track = framing.find_subject_track(
+        video, (0.0, 8.0), window=0.3, samples=12, work_dir=tmp_path,
+    )
+    assert track[0]["start"] == 0.0
+    assert abs(track[-1]["end"] - 8.0) < 0.5
+    for a, b in zip(track, track[1:]):
+        assert abs(a["end"] - b["start"]) < 1e-6, "gap in the track"

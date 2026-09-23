@@ -219,6 +219,8 @@ All optional — see `.env.example`. The defaults are what the numbers below wer
 | `TOPIC_SHIFT_THRESHOLD`                    | `0.62`              | Similarity below which a topic has changed     |
 | `RENDER_FILL`                              | `crop`              | `crop` / `blur` / `auto` for landscape sources |
 | `FRAMING_SAMPLES`                          | `12`                | Frames sampled to locate the subject           |
+| `FRAMING_PER_SHOT`                         | `true`              | Re-frame on each cut, not once per clip        |
+| `SPEAKER_TRACKING`                         | `true`              | Follow the talker when two faces share a shot  |
 | `WINDOW_MAX_SECONDS`                       | `90`                | Retrieval window cap, independent of clip cap  |
 | `CLIP_TARGET_SECONDS`                      | `45`                | Window size for retrieval and clipping         |
 | `MAX_CLIPS`                                | `5`                 | Clips rendered per job                         |

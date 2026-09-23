@@ -17,8 +17,9 @@ MEDIA_DIR = DATA_DIR / "media"
 CLIP_DIR = DATA_DIR / "clips"
 CHROMA_DIR = DATA_DIR / "chroma"
 JOB_DIR = DATA_DIR / "jobs"
+MODEL_DIR = DATA_DIR / "models"
 
-for _d in (UPLOAD_DIR, MEDIA_DIR, CLIP_DIR, CHROMA_DIR, JOB_DIR):
+for _d in (UPLOAD_DIR, MEDIA_DIR, CLIP_DIR, CHROMA_DIR, JOB_DIR, MODEL_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -137,6 +138,17 @@ RENDER_HEIGHT = int(os.getenv("RENDER_HEIGHT", "1920"))
 RENDER_FILL = os.getenv("RENDER_FILL", "crop").strip().lower()
 # Sample this many frames per span when locating the subject.
 FRAMING_SAMPLES = int(os.getenv("FRAMING_SAMPLES", "12"))
+# Re-frame on every cut instead of using one crop for the whole clip. A single
+# position is a compromise across every shot: measured on a 95s talking-head
+# clip with b-roll inserts, the best crop moved 7% of the frame width between
+# shots, a quarter of the crop window.
+FRAMING_PER_SHOT = _flag("FRAMING_PER_SHOT", True)
+# Within a shot, follow whoever is speaking. Only bites on a locked-off shot
+# holding two or more faces — an interview, a podcast wide — where the editor
+# never cuts and per-shot framing has nothing to work with. Needs mediapipe
+# and a one-off ~230 KB model download; falls back to per-shot framing if
+# either is missing, or if the evidence does not clearly favour one face.
+SPEAKER_TRACKING = _flag("SPEAKER_TRACKING", True)
 BURN_CAPTIONS = _flag("BURN_CAPTIONS", True)
 # auto   - libass if this ffmpeg has it, else the built-in Pillow renderer
 # libass - require ffmpeg's subtitles filter
